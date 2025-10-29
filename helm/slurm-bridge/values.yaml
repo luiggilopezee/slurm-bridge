@@ -10,12 +10,14 @@ fullnameOverride: ""
 namespaceOverride: ""
 
 # Default values for slurm-bridge.
+imagePullSecrets:
+  - name: regcred
 scheduler:
   # -- The image to use, `${repository}:${tag}`.
   # Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names
   image:
-    repository: ghcr.io/slinkyproject/slurm-bridge-scheduler
-    tag: ""
+    repository: sci-docker.ncats.nih.gov/ghcr.io/slinkyproject/slurm-bridge-scheduler
+    tag: "0.4.1"
   # -- Set the number of replicas to deploy.
   replicaCount: 1
   # -- Enables leader election.
@@ -53,7 +55,7 @@ schedulerConfig:
   mcsLabel: kubernetes
   # -- Set the default Slurm partition to use for external jobs.
   # Ref: https://slurm.schedmd.com/sbatch.html#OPT_partition
-  partition: slurm-bridge
+  partition: K8s
 
 # Configuration settings for the admission controller.
 admission:
@@ -62,8 +64,8 @@ admission:
   # -- The image to use, `${repository}:${tag}`.
   # Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names
   image:
-    repository: ghcr.io/slinkyproject/slurm-bridge-admission
-    tag: ""
+    repository: sci-docker.ncats.nih.gov/ghcr.io/slinkyproject/slurm-bridge-admission
+    tag: "0.4.1"
   # Cert-Manager certificate configurations.
   certManager:
     # -- Enables cert-manager for certificate management.
@@ -111,8 +113,8 @@ controllers:
   # -- The image to use, `${repository}:${tag}`.
   # Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names
   image:
-    repository: ghcr.io/slinkyproject/slurm-bridge-controllers
-    tag: ""
+    repository: sci-docker.ncats.nih.gov/ghcr.io/slinkyproject/slurm-bridge-controllers
+    tag: "0.4.1"
   # -- Set the number of replicas to deploy.
   replicas: 1
   # -- Set the priority class to use.
@@ -142,6 +144,6 @@ controllers:
 # Configurations shared among all components.
 sharedConfig:
   # -- The Slurm REST API URL in the form of: `[protocol]://[host]:[port]`
-  slurmRestApi: http://slurm-restapi.slurm:6820
+  slurmRestApi: http://sci-repo:6820
   # -- The secret containing a SLURM_JWT token for authentication.
-  slurmJwtSecret: slurm-bridge-token
+  slurmJwtSecret: slurm-bridge-jwt-token

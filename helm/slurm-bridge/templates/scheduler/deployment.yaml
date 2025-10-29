@@ -24,6 +24,9 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       serviceAccountName: {{ include "slurm-bridge.scheduler.name" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 10}}
+      {{- end }}
       containers:
       - args:
         - --config=/etc/kubernetes/scheduler-config.yaml

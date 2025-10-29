@@ -24,6 +24,9 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       serviceAccountName: {{ include "slurm-bridge.controllers.name" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 10}}
+      {{- end }}
       containers:
         - name: {{ include "slurm-bridge.controllers.name" . }}
           image: {{ include "slurm-bridge.controllers.imageRef" . }}
