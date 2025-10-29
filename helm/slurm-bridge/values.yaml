@@ -10,6 +10,7 @@ fullnameOverride: ""
 namespaceOverride: ""
 
 # Default values for slurm-bridge.
+imagePullSecrets: []
 scheduler:
   # -- The image to use, `${repository}:${tag}`.
   # Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names

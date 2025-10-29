@@ -27,6 +27,9 @@ spec:
       priorityClassName: {{ . }}
       {{- end }}
       serviceAccountName: {{ include "slurm-bridge.admission.name" . }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets: {{- toYaml . | nindent 10}}
+      {{- end }}
       containers:
         - name: {{ include "slurm-bridge.admission.name" . }}
           image: {{ include "slurm-bridge.admission.imageRef" . }}
