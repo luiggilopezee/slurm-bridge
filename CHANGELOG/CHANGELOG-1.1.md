@@ -1,3 +1,91 @@
+## v1.1.3
+
+### Fixed
+
+- Add a 5m timeout to all slurm rest calls.
+- GO-2026-5026 GO-2026-5942 GO-2026-5972 GO-2026-6088 GO-2026-6089 GO-2026-6090
+  GO-2026-6091 GO-2026-6218.
+- GO-2026-6094 GO-2026-6095 GO-2026-6107 GO-2026-6112 GO-2026-6274 GO-2026-6275.
+- External jobs should not require all nodes.
+- GO-2026-6303.
+
+### Changed
+
+- PostFilter now uses list to scan slurm nodes.
+- Limit excluded nodes to nodes belonging to the target slurm partition.
+
+## v1.1.2
+
+### Added
+
+- Added configurable ImagePullPolicy.
+- Slurm-minimum-version annotation in helm chart.
+
+### Fixed
+
+- Fixed nodeSelector and affinity fields for deployments.
+- Omit empty CPU DRA requests and fail on incomplete allocations.
+- Resolved DRA prebind when kube and Slurm node names differ and allocation
+  pools do not match node names.
+- Fix external job update code path from being unreachable.
+- Protect against a race condition where an external job update may occur but
+  the external job has started.
+- Allow pods to be annotated if an external job update race occurs and the job
+  is already running.
+- Fix pods going into unschedulable queue for situations in which they should
+  stay in the backoffq/activeq.
+- Fix namespace override.
+- Fixed config changes not rolling out after a helm upgrade.
+- Skip empty DRA claims and use pod resource names in mappings.
+- Match DRA mappings only to full device class names.
+- Delete bound pods after their Slurm placeholder job stops running.
+- Reject unsupported DRA DeviceClass requests from multiple containers.
+- Keep DRA GPU request names consistent across claims, mappings, and
+  allocations.
+- Limit DRA claims and allocations to the GRES requested by each pod.
+- Fixed repeated termination of jobs.
+- The node controller will watch resourcesliecs for changes to external nodes in
+  order to update them.
+- Replace /readyz probe with StartedChecker instead of a ping.
+- Correct the readinessProbe to use /readyz.
+- GO-2026-5942 GO-2026-5970.
+- GO-2026-5158.
+- GO-2026-4970 GO-2026-5856 GO-2026-6061.
+- Set the Helm chart appVersion to the slurm-bridge release version.
+
+### Changed
+
+- Disabled SchedulerPopFromBackoffQ.
+
+## v1.1.1
+
+### Added
+
+- Added pods/finalizers resource to RBAC rules.
+- Use cosign to sign image artifacts.
+
+### Fixed
+
+- Update opentelemetry to resolve CVE-2026-39883.
+- Fixed reconciliation of Slurm nodes to prevent the deletion of non-external
+  nodes.
+- GO-2026-4918 GO-2026-4971 GO-2026-4976 GO-2026-4977 GO-2026-4980 GO-2026-4981
+  GO-2026-4982 GO-2026-4986.
+- GO-2026-5005 GO-2026-5006 GO-2026-5013 GO-2026-5014 GO-2026-5015 GO-2026-5016
+  GO-2026-5017 GO-2026-5018 GO-2026-5019 GO-2026-5020 GO-2026-5021 GO-2026-5023
+  GO-2026-5024 GO-2026-5025 GO-2026-5026 GO-2026-5027 GO-2026-5028 GO-2026-5029
+  GO-2026-5030 GO-2026-5033.
+- Prevent pods with non-existent resource requests from being bound by
+  slurm-bridge.
+- Fixes bug whereby multiple ResourceClaims were created after claim bind
+  failures.
+- GO-2026-5037 GO-2026-5038 GO-2026-5039.
+- Removed namespace from jwtKeyRef.
+
+### Changed
+
+- Slurm-bridge is now deployed to the slurm namespace instead of slinky.
+
 ## v1.1.0
 
 ### Fixed

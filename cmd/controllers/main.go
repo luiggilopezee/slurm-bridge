@@ -7,16 +7,13 @@ import (
 	"context"
 	"crypto/tls"
 	"flag"
+	"net/http"
 	"os"
-
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
-
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
 
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -24,13 +21,14 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
+	slurmtoken "github.com/SlinkyProject/slurm-client/pkg/client/token"
 
 	"github.com/SlinkyProject/slurm-bridge/internal/config"
 	"github.com/SlinkyProject/slurm-bridge/internal/controller/node"
+	nodeutils "github.com/SlinkyProject/slurm-bridge/internal/controller/node/utils"
 	"github.com/SlinkyProject/slurm-bridge/internal/controller/pod"
 	"github.com/SlinkyProject/slurm-bridge/internal/runnable/slurmjob"
 	"github.com/SlinkyProject/slurm-bridge/internal/runnable/slurmnode"
-	// +kubebuilder:scaffold:imports
 )
 
 var (
@@ -43,6 +41,9 @@ func init() {
 
 	// +kubebuilder:scaffold:scheme
 }
+
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=create;get;list;update
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 // Input flags to the command
 type Flags struct {
@@ -114,19 +115,31 @@ func main() {
 		os.Exit(1)
 	}
 
+	if err := nodeutils.SetupFieldIndexers(mgr); err != nil {
+		setupLog.Error(err, "unable to set up field indexers")
+		os.Exit(1)
+	}
+
 	data, err := os.ReadFile(flags.configFile)
 	if err != nil {
 		setupLog.Error(err, "unable to read config file", "file", flags.configFile)
 		os.Exit(1)
 	}
-	cfg := config.UnmarshalOrDie(data)
+	cfg, err := config.Unmarshal(data)
+	if err != nil {
+		setupLog.Error(err, "unable to parse config file", "file", flags.configFile)
+		os.Exit(1)
+	}
+	draRegistry, err := cfg.DRARegistry()
+	if err != nil {
+		setupLog.Error(err, "unable to configure DRA device profiles")
+		os.Exit(1)
+	}
 
 	clientConfig := &slurmclient.Config{
-		Server: cfg.SlurmRestApi,
-		AuthToken: func() string {
-			token, _ := os.LookupEnv("SLURM_JWT")
-			return token
-		}(),
+		Server:        cfg.SlurmRestApi,
+		TokenProvider: slurmtoken.FileProvider{Path: os.Getenv("SLURM_JWT_FILE")},
+		HTTPClient:    &http.Client{Timeout: config.SlurmClientTimeout},
 	}
 	slurmClient, err := slurmclient.NewClient(clientConfig)
 	if err != nil {
@@ -136,7 +149,7 @@ func main() {
 	go slurmClient.Start(context.Background())
 
 	nodeEventCh := make(chan event.GenericEvent, 100)
-	if err := node.NewReconciler(mgr.GetClient(), slurmClient, cfg.SchedulerName, nodeEventCh).SetupWithManager(mgr); err != nil {
+	if err := node.NewReconciler(mgr.GetClient(), slurmClient, cfg.SchedulerName, nodeEventCh, draRegistry).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "Node")
 		os.Exit(1)
 	}

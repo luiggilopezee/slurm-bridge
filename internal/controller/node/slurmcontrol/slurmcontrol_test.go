@@ -7,7 +7,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"slices"
 	"strings"
 	"testing"
@@ -19,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/dynamic-resource-allocation/structured"
 	"k8s.io/utils/ptr"
 	ctrlclientfake "sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -29,6 +29,7 @@ import (
 	"github.com/SlinkyProject/slurm-client/pkg/object"
 	"github.com/SlinkyProject/slurm-client/pkg/types"
 
+	"github.com/SlinkyProject/slurm-bridge/internal/dra"
 	"github.com/SlinkyProject/slurm-bridge/internal/nodeinfo"
 	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 )
@@ -38,7 +39,7 @@ func init() {
 }
 
 func testNodeCPUResourceSlice(nodeName string) *resourcev1.ResourceSlice {
-	coreType := ptr.To(int64(nodeinfo.CoreTypeStandard))
+	coreType := ptr.To(nodeinfo.CoreTypeStandard.String())
 	device := func(name string, cpuID, coreID int64) resourcev1.Device {
 		return resourcev1.Device{
 			Name: name,
@@ -46,7 +47,7 @@ func testNodeCPUResourceSlice(nodeName string) *resourcev1.ResourceSlice {
 				nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To(cpuID)},
 				nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To(coreID)},
 				nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-				nodeinfo.DraDriverCpu_CoreType: {IntValue: coreType},
+				nodeinfo.DraDriverCpu_CoreType: {StringValue: coreType},
 			},
 		}
 	}
@@ -55,6 +56,11 @@ func testNodeCPUResourceSlice(nodeName string) *resourcev1.ResourceSlice {
 		Spec: resourcev1.ResourceSliceSpec{
 			NodeName: ptr.To(nodeName),
 			Driver:   nodeinfo.DraDriverCpu,
+			Pool: resourcev1.ResourcePool{
+				Name:               nodeName,
+				Generation:         1,
+				ResourceSliceCount: 1,
+			},
 			Devices: []resourcev1.Device{
 				device("cpu0", 0, 0),
 				device("cpu1", 1, 0),
@@ -63,6 +69,25 @@ func testNodeCPUResourceSlice(nodeName string) *resourcev1.ResourceSlice {
 			},
 		},
 	}
+}
+
+func testNodeInfoFromResourceSlices(t *testing.T, nodeName string, resourceSlices []resourcev1.ResourceSlice) *nodeinfo.NodeInfo {
+	t.Helper()
+	info, err := nodeinfo.NewNodeInfoFromResourceSlices(nodeName, resourceSlices)
+	if err != nil {
+		t.Fatalf("NewNodeInfoFromResourceSlices() error = %v", err)
+	}
+	return info
+}
+
+func testExampleDRAInventory() []dra.GRESInventory {
+	return []dra.GRESInventory{{
+		GRES: dra.GRES{Name: "gpu", Type: "gpu-example"},
+		Devices: []dra.DeviceIdentity{
+			structured.MakeDeviceID("gpu.example.com", "pool-a", "gpu-0"),
+			structured.MakeDeviceID("gpu.example.com", "pool-a", "gpu-1"),
+		},
+	}}
 }
 
 func Test_realSlurmControl_GetNodeNames(t *testing.T) {
@@ -632,12 +657,14 @@ func Test_realSlurmControl_NodeNeedsRecreate(t *testing.T) {
 	}
 
 	tests := []struct {
-		name     string
-		client   slurmclient.Client
-		node     *corev1.Node
-		nodeInfo *nodeinfo.NodeInfo
-		want     bool
-		wantErr  bool
+		name         string
+		client       slurmclient.Client
+		node         *corev1.Node
+		nodeInfo     *nodeinfo.NodeInfo
+		draInventory []dra.GRESInventory
+		want         bool
+		wantErr      bool
+		wantErrText  string
 	}{
 		{
 			name:   "node does not exist in Slurm",
@@ -676,6 +703,42 @@ func Test_realSlurmControl_NodeNeedsRecreate(t *testing.T) {
 			want: true,
 		},
 		{
+			name: "node exists with matching DRA CPU topology",
+			client: fake.NewClientBuilder().WithObjects(
+				&types.V0044Node{
+					V0044Node: api.V0044Node{
+						Name:       ptr.To("worker-0"),
+						Sockets:    ptr.To(int32(1)),
+						Cores:      ptr.To(int32(2)),
+						Threads:    ptr.To(int32(2)),
+						Cpus:       ptr.To(int32(4)),
+						RealMemory: ptr.To(int64(8192)),
+					},
+				},
+			).Build(),
+			node:     makeNode("worker-0", 12, 8),
+			nodeInfo: testNodeInfoFromResourceSlices(t, "worker-0", []resourcev1.ResourceSlice{*testNodeCPUResourceSlice("worker-0")}),
+			want:     false,
+		},
+		{
+			name: "node exists with different DRA CPU topology",
+			client: fake.NewClientBuilder().WithObjects(
+				&types.V0044Node{
+					V0044Node: api.V0044Node{
+						Name:       ptr.To("worker-0"),
+						Sockets:    ptr.To(int32(1)),
+						Cores:      ptr.To(int32(4)),
+						Threads:    ptr.To(int32(1)),
+						Cpus:       ptr.To(int32(4)),
+						RealMemory: ptr.To(int64(8192)),
+					},
+				},
+			).Build(),
+			node:     makeNode("worker-0", 12, 8),
+			nodeInfo: testNodeInfoFromResourceSlices(t, "worker-0", []resourcev1.ResourceSlice{*testNodeCPUResourceSlice("worker-0")}),
+			want:     true,
+		},
+		{
 			name: "node exists, different memory",
 			client: fake.NewClientBuilder().WithObjects(
 				&types.V0044Node{
@@ -706,20 +769,86 @@ func Test_realSlurmControl_NodeNeedsRecreate(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "node exists, desired gres empty (nodeInfo no GPUs) slurm has gres",
+			name: "node exists with matching profile inventory",
 			client: fake.NewClientBuilder().WithObjects(
 				&types.V0044Node{
 					V0044Node: api.V0044Node{
 						Name:       ptr.To("worker-0"),
 						Cpus:       ptr.To(int32(4)),
 						RealMemory: ptr.To(int64(8192)),
-						Gres:       ptr.To("gpu:driver:1"),
+						Gres:       ptr.To("gpu:gpu-example:2"),
+						Extra:      ptr.To(`slurm-bridge.dra-gres-map={"v":1,"profiles":{"gpu-example":["/dra/gpu.example.com/pool-a/gpu-0","/dra/gpu.example.com/pool-a/gpu-1"]}}`),
 					},
 				},
 			).Build(),
-			node:     makeNode("worker-0", 4, 8),
-			nodeInfo: &nodeinfo.NodeInfo{},
-			want:     true,
+			node:         makeNode("worker-0", 4, 8),
+			draInventory: testExampleDRAInventory(),
+			want:         false,
+		},
+		{
+			name: "node exists with stale applied profile inventory",
+			client: fake.NewClientBuilder().WithObjects(
+				&types.V0044Node{
+					V0044Node: api.V0044Node{
+						Name:       ptr.To("worker-0"),
+						Cpus:       ptr.To(int32(4)),
+						RealMemory: ptr.To(int64(8192)),
+						Gres:       ptr.To("gpu:gpu-example:2"),
+						Extra:      ptr.To(`slurm-bridge.dra-gres-map={"v":1,"profiles":{"gpu-example":["/dra/gpu.example.com/pool-a/gpu-0"]}}`),
+					},
+				},
+			).Build(),
+			node:         makeNode("worker-0", 4, 8),
+			draInventory: testExampleDRAInventory(),
+			want:         true,
+		},
+		{
+			name: "node exists with removed profile inventory",
+			client: fake.NewClientBuilder().WithObjects(
+				&types.V0044Node{
+					V0044Node: api.V0044Node{
+						Name:       ptr.To("worker-0"),
+						Cpus:       ptr.To(int32(4)),
+						RealMemory: ptr.To(int64(8192)),
+						Extra:      ptr.To(`slurm-bridge.dra-gres-map={"v":1,"profiles":{}}`),
+					},
+				},
+			).Build(),
+			node: makeNode("worker-0", 4, 8),
+			want: true,
+		},
+		{
+			name: "node exists with unrelated extra and no profile inventory",
+			client: fake.NewClientBuilder().WithObjects(
+				&types.V0044Node{
+					V0044Node: api.V0044Node{
+						Name:       ptr.To("worker-0"),
+						Cpus:       ptr.To(int32(4)),
+						RealMemory: ptr.To(int64(8192)),
+						Extra:      ptr.To("owned by an administrator"),
+					},
+				},
+			).Build(),
+			node: makeNode("worker-0", 4, 8),
+			want: false,
+		},
+		{
+			name: "node exists with unrelated extra and profile inventory",
+			client: fake.NewClientBuilder().WithObjects(
+				&types.V0044Node{
+					V0044Node: api.V0044Node{
+						Name:       ptr.To("worker-0"),
+						Cpus:       ptr.To(int32(4)),
+						RealMemory: ptr.To(int64(8192)),
+						Gres:       ptr.To("gpu:gpu-example:2"),
+						Extra:      ptr.To("owned by an administrator"),
+					},
+				},
+			).Build(),
+			node:         makeNode("worker-0", 4, 8),
+			draInventory: testExampleDRAInventory(),
+			wantErr:      true,
+			wantErrText:  `cannot record applied DRA inventory on Slurm node "worker-0": Extra field is already in use`,
 		},
 		{
 			name: "get error",
@@ -758,10 +887,13 @@ func Test_realSlurmControl_NodeNeedsRecreate(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			r := &realSlurmControl{Client: tt.client}
-			got, err := r.NodeNeedsRecreate(ctx, tt.node, tt.nodeInfo)
+			got, err := r.NodeNeedsRecreate(ctx, tt.node, tt.nodeInfo, tt.draInventory)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("NodeNeedsRecreate() error = %v, wantErr %v", err, tt.wantErr)
 				return
+			}
+			if tt.wantErrText != "" && !strings.Contains(err.Error(), tt.wantErrText) {
+				t.Errorf("NodeNeedsRecreate() error = %v, want containing %q", err, tt.wantErrText)
 			}
 			if got != tt.want {
 				t.Errorf("NodeNeedsRecreate() = %v, want %v", got, tt.want)
@@ -842,67 +974,6 @@ func Test_realSlurmControl_RemoveNode(t *testing.T) {
 			err := r.RemoveNode(ctx, tt.node)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("RemoveNode() error = %v, wantErr %v", err, tt.wantErr)
-			}
-		})
-	}
-}
-
-func Test_tolerateError(t *testing.T) {
-	type args struct {
-		err error
-	}
-	tests := []struct {
-		name string
-		args args
-		want bool
-	}{
-		{
-			name: "Nil",
-			args: args{
-				err: nil,
-			},
-			want: true,
-		},
-		{
-			name: "Empty",
-			args: args{
-				err: errors.New(""),
-			},
-			want: false,
-		},
-		{
-			name: "NotFound",
-			args: args{
-				err: errors.New(http.StatusText(http.StatusNotFound)),
-			},
-			want: true,
-		},
-		{
-			name: "NoContent",
-			args: args{
-				err: errors.New(http.StatusText(http.StatusNoContent)),
-			},
-			want: true,
-		},
-		{
-			name: "Forbidden",
-			args: args{
-				err: errors.New(http.StatusText(http.StatusForbidden)),
-			},
-			want: false,
-		},
-		{
-			name: "wrapped Not Found (e.g. slurm-client cache sync)",
-			args: args{
-				err: errors.New("failed to wait on type V0044JobInfo object 69 cache sync: [Not Found, Invalid job id specified]"),
-			},
-			want: true,
-		},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tolerateError(tt.args.err); got != tt.want {
-				t.Errorf("tolerateError() = %v, want %v", got, tt.want)
 			}
 		})
 	}
@@ -1233,7 +1304,7 @@ func Test_realSlurmControl_AddNode(t *testing.T) {
 			wantErr: false,
 		},
 		{
-			name: "add node with nodeInfo from NewNodeInfo (GRES)",
+			name: "add node with CPU topology from NewNodeInfo",
 			fields: fields{
 				Client: fake.NewFakeClient(),
 			},
@@ -1251,30 +1322,7 @@ func Test_realSlurmControl_AddNode(t *testing.T) {
 				nodeInfo: func() *nodeinfo.NodeInfo {
 					kubeClient := ctrlclientfake.NewClientBuilder().
 						WithScheme(scheme.Scheme).
-						WithObjects(
-							testNodeCPUResourceSlice("test-node"),
-							&resourcev1.ResourceSlice{
-								ObjectMeta: metav1.ObjectMeta{Name: "test-node-gpu-slice"},
-								Spec: resourcev1.ResourceSliceSpec{
-									NodeName: ptr.To("test-node"),
-									Driver:   nodeinfo.DraExampleDriver,
-									Devices: []resourcev1.Device{
-										{
-											Name: "gpu-0",
-											Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-												nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](0)},
-											},
-										},
-										{
-											Name: "gpu-1",
-											Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-												nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](1)},
-											},
-										},
-									},
-								},
-							},
-						).
+						WithObjects(testNodeCPUResourceSlice("test-node")).
 						Build()
 					info, err := nodeinfo.NewNodeInfo(context.Background(), kubeClient, "test-node")
 					if err != nil {
@@ -1291,14 +1339,63 @@ func Test_realSlurmControl_AddNode(t *testing.T) {
 			r := &realSlurmControl{
 				Client: tt.fields.Client,
 			}
-			if err := r.AddNode(tt.args.ctx, tt.args.node, tt.args.nodeInfo); (err != nil) != tt.wantErr {
+			if err := r.AddNode(tt.args.ctx, tt.args.node, tt.args.nodeInfo, nil); (err != nil) != tt.wantErr {
 				t.Errorf("realSlurmControl.AddNode() error = %v, wantErr %v", err, tt.wantErr)
 			}
 		})
 	}
 }
 
-func Test_realSlurmControl_AddNode_withNodeInfo_includesGRESInNodeConfig(t *testing.T) {
+func Test_realSlurmControl_AddNode_includesAppliedDRAInventory(t *testing.T) {
+	var nodeConf string
+	var extra string
+	var comment *string
+	f := interceptor.Funcs{
+		Create: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.CreateOption) error {
+			if r, ok := req.(api.V0044OpenapiCreateNodeReq); ok {
+				nodeConf = r.NodeConf
+			}
+			return nil
+		},
+		Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+			if r, ok := req.(api.V0044UpdateNodeMsg); ok {
+				extra = ptr.Deref(r.Extra, "")
+				comment = r.Comment
+			}
+			return nil
+		},
+	}
+	r := &realSlurmControl{Client: fake.NewClientBuilder().WithInterceptorFuncs(f).Build()}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
+		Status: corev1.NodeStatus{Capacity: corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("4"),
+			corev1.ResourceMemory: resource.MustParse("8Gi"),
+		}},
+	}
+	if err := r.AddNode(context.Background(), node, nil, testExampleDRAInventory()); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+
+	wants := []string{
+		`Gres="gpu:gpu-example:2"`,
+		`GresConf="count=1,name=gpu,type=gpu-example,file=/dra/gpu.example.com/pool-a/gpu-0+count=1,name=gpu,type=gpu-example,file=/dra/gpu.example.com/pool-a/gpu-1"`,
+	}
+	for _, want := range wants {
+		if !strings.Contains(nodeConf, want) {
+			t.Errorf("NodeConf missing %q: %q", want, nodeConf)
+		}
+	}
+	wantExtra := `slurm-bridge.dra-gres-map={"v":1,"profiles":{"gpu-example":["/dra/gpu.example.com/pool-a/gpu-0","/dra/gpu.example.com/pool-a/gpu-1"]}}`
+	if extra != wantExtra {
+		t.Errorf("AddNode() extra = %q, want %q", extra, wantExtra)
+	}
+	if comment != nil {
+		t.Errorf("AddNode() comment = %q, want nil", ptr.Deref(comment, ""))
+	}
+}
+
+func Test_realSlurmControl_AddNode_includesTopologyInNodeConfig(t *testing.T) {
 	var nodeConf string
 	f := interceptor.Funcs{
 		Create: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.CreateOption) error {
@@ -1308,33 +1405,91 @@ func Test_realSlurmControl_AddNode_withNodeInfo_includesGRESInNodeConfig(t *test
 			return nil
 		},
 	}
-	slurmClient := fake.NewClientBuilder().WithInterceptorFuncs(f).Build()
-	kubeClient := ctrlclientfake.NewClientBuilder().
-		WithScheme(scheme.Scheme).
-		WithObjects(
-			testNodeCPUResourceSlice("test-node"),
-			&resourcev1.ResourceSlice{
-				ObjectMeta: metav1.ObjectMeta{Name: "test-node-gpu-slice"},
-				Spec: resourcev1.ResourceSliceSpec{
-					NodeName: ptr.To("test-node"),
-					Driver:   nodeinfo.DraExampleDriver,
-					Devices: []resourcev1.Device{
-						{
-							Name: "gpu-0",
-							Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-								nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](0)},
-							},
-						},
-					},
-				},
-			},
-		).
-		Build()
-	nodeInfo, err := nodeinfo.NewNodeInfo(context.Background(), kubeClient, "test-node")
-	if err != nil {
-		t.Fatalf("NewNodeInfo: %v", err)
+	r := &realSlurmControl{
+		Client: fake.NewClientBuilder().WithInterceptorFuncs(f).Build(),
 	}
-	r := &realSlurmControl{Client: slurmClient}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+			Annotations: map[string]string{
+				wellknown.AnnotationNodeTopologySpec: "topo-switch:s1",
+			},
+		},
+		Status: corev1.NodeStatus{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8Gi"),
+			},
+		},
+	}
+	if err := r.AddNode(context.Background(), node, nil, nil); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	if !strings.Contains(nodeConf, "Topology=topo-switch:s1") {
+		t.Errorf("NodeConf missing topology: %q", nodeConf)
+	}
+}
+
+func Test_realSlurmControl_AddNode_updatesExistingNodeTopology(t *testing.T) {
+	var gotTopology string
+	f := interceptor.Funcs{
+		Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+			if r, ok := req.(api.V0044UpdateNodeMsg); ok && r.TopologyStr != nil {
+				gotTopology = *r.TopologyStr
+			}
+			return nil
+		},
+	}
+	existingNode := &types.V0044Node{
+		V0044Node: api.V0044Node{
+			Name:     ptr.To("test-node"),
+			Topology: ptr.To("topo-switch:s1"),
+		},
+	}
+	r := &realSlurmControl{
+		Client: fake.NewClientBuilder().WithObjects(existingNode).WithInterceptorFuncs(f).Build(),
+	}
+	node := &corev1.Node{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "test-node",
+			Annotations: map[string]string{
+				wellknown.AnnotationNodeTopologySpec: "topo-switch:s2",
+			},
+		},
+		Status: corev1.NodeStatus{
+			Capacity: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse("4"),
+				corev1.ResourceMemory: resource.MustParse("8Gi"),
+			},
+		},
+	}
+	if err := r.AddNode(context.Background(), node, nil, nil); err != nil {
+		t.Fatalf("AddNode: %v", err)
+	}
+	if gotTopology != "topo-switch:s2" {
+		t.Errorf("TopologyStr = %q, want %q", gotTopology, "topo-switch:s2")
+	}
+}
+
+func Test_realSlurmControl_AddNode_clearsExistingNodeTopology(t *testing.T) {
+	gotTopology := "unset"
+	f := interceptor.Funcs{
+		Update: func(ctx context.Context, obj object.Object, req any, opts ...slurmclient.UpdateOption) error {
+			if r, ok := req.(api.V0044UpdateNodeMsg); ok && r.TopologyStr != nil {
+				gotTopology = *r.TopologyStr
+			}
+			return nil
+		},
+	}
+	existingNode := &types.V0044Node{
+		V0044Node: api.V0044Node{
+			Name:     ptr.To("test-node"),
+			Topology: ptr.To("topo-switch:s1"),
+		},
+	}
+	r := &realSlurmControl{
+		Client: fake.NewClientBuilder().WithObjects(existingNode).WithInterceptorFuncs(f).Build(),
+	}
 	node := &corev1.Node{
 		ObjectMeta: metav1.ObjectMeta{Name: "test-node"},
 		Status: corev1.NodeStatus{
@@ -1344,16 +1499,10 @@ func Test_realSlurmControl_AddNode_withNodeInfo_includesGRESInNodeConfig(t *test
 			},
 		},
 	}
-	if err := r.AddNode(context.Background(), node, nodeInfo); err != nil {
+	if err := r.AddNode(context.Background(), node, nil, nil); err != nil {
 		t.Fatalf("AddNode: %v", err)
 	}
-	if nodeConf == "" {
-		t.Fatal("Create was not called or NodeConf was not captured")
-	}
-	if !strings.Contains(nodeConf, "Gres=") {
-		t.Errorf("NodeConf missing Gres=: %q", nodeConf)
-	}
-	if !strings.Contains(nodeConf, "GresConf=") {
-		t.Errorf("NodeConf missing GresConf=: %q", nodeConf)
+	if gotTopology != "" {
+		t.Errorf("TopologyStr = %q, want empty string", gotTopology)
 	}
 }

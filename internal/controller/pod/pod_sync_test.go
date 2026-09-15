@@ -22,7 +22,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/event"
 
 	api "github.com/SlinkyProject/slurm-client/api/v0044"
+	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
 	slurmclientfake "github.com/SlinkyProject/slurm-client/pkg/client/fake"
+	slurminterceptor "github.com/SlinkyProject/slurm-client/pkg/client/interceptor"
+	slurmobject "github.com/SlinkyProject/slurm-client/pkg/object"
 	slurmtypes "github.com/SlinkyProject/slurm-client/pkg/types"
 
 	"github.com/SlinkyProject/slurm-bridge/internal/controller/pod/slurmcontrol"
@@ -52,6 +55,7 @@ func newPod(name string, jobId int32) *corev1.Pod {
 		},
 		Spec: corev1.PodSpec{
 			SchedulerName: schedulerName,
+			NodeName:      "test-node",
 		},
 		Status: corev1.PodStatus{
 			Phase: corev1.PodRunning,
@@ -64,6 +68,30 @@ func newPod(name string, jobId int32) *corev1.Pod {
 			},
 		},
 	}
+}
+
+// newQueuedPod returns a pod that has not been bound yet (awaiting
+// placement).
+func newQueuedPod(name string, jobId int32) *corev1.Pod {
+	pod := newPod(name, jobId)
+	pod.Spec.NodeName = ""
+	pod.Status.Phase = corev1.PodPending
+	pod.Status.Conditions = nil
+	return pod
+}
+
+// newNotReadyPod returns a pod bound to a Slurm job that is Running but not
+// Ready (e.g. crash-looping).
+func newNotReadyPod(name string, jobId int32) *corev1.Pod {
+	pod := newPod(name, jobId)
+	pod.Status.Conditions = []corev1.PodCondition{
+		{
+			Type:               corev1.PodReady,
+			LastTransitionTime: metav1.Now(),
+			Status:             corev1.ConditionFalse,
+		},
+	}
+	return pod
 }
 
 func newTerminatingPod(name string, jobId int32) *corev1.Pod {
@@ -112,6 +140,40 @@ var _ = Describe("syncKubernetes()", func() {
 						AdminComment: ptr.To(newExternalJobInfo("bar").ToString()),
 					},
 				},
+				{
+					V0044JobInfo: api.V0044JobInfo{
+						JobId:        ptr.To[int32](3),
+						JobState:     &[]api.V0044JobInfoJobState{api.V0044JobInfoJobStateRUNNING},
+						AdminComment: ptr.To(newExternalJobInfo("crashloop").ToString()),
+					},
+				},
+				{
+					V0044JobInfo: api.V0044JobInfo{
+						JobId: ptr.To[int32](4),
+						JobState: &[]api.V0044JobInfoJobState{
+							api.V0044JobInfoJobStatePENDING,
+							api.V0044JobInfoJobStatePREEMPTED,
+						},
+						AdminComment: ptr.To(newExternalJobInfo("requeued").ToString()),
+					},
+				},
+				{
+					V0044JobInfo: api.V0044JobInfo{
+						JobId: ptr.To[int32](5),
+						JobState: &[]api.V0044JobInfoJobState{
+							api.V0044JobInfoJobStatePENDING,
+							api.V0044JobInfoJobStatePREEMPTED,
+						},
+						AdminComment: ptr.To(newExternalJobInfo("requeued-bound").ToString()),
+					},
+				},
+				{
+					V0044JobInfo: api.V0044JobInfo{
+						JobId:        ptr.To[int32](6),
+						JobState:     &[]api.V0044JobInfoJobState{api.V0044JobInfoJobStateSUSPENDED},
+						AdminComment: ptr.To(newExternalJobInfo("suspended").ToString()),
+					},
+				},
 			},
 		}
 		c := slurmclientfake.NewClientBuilder().WithLists(jobList).Build()
@@ -119,6 +181,12 @@ var _ = Describe("syncKubernetes()", func() {
 			Items: []corev1.Pod{
 				*newPod(podName, jobId),
 				*newPod("bar", 0),
+				*newQueuedPod("unlabeled-queued", 0),
+				*newNotReadyPod("crashloop", 3),
+				*newQueuedPod("queued", 4),
+				*newNotReadyPod("requeued-bound", 5),
+				*newPod("suspended", 6),
+				*newQueuedPod("queued-dead", 7),
 			},
 		}
 		controller = &PodReconciler{
@@ -156,6 +224,118 @@ var _ = Describe("syncKubernetes()", func() {
 
 			By("Check pod existence")
 			key := types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: podName}
+			pod := &corev1.Pod{}
+			err = controller.Get(ctx, key, pod)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+	})
+
+	Context("With a not-Ready (crash-looping) pod", func() {
+		// Regression: a crash-looping pod is never Ready, but its Slurm job
+		// can still be preempted/canceled. It must be deleted like any
+		// other pod, or its ResourceClaim keeps a device allocation that
+		// Slurm has already handed to another pod (device double-booking).
+		It("Should terminate the pod when its job is gone", func() {
+			By("Terminating the corresponding Slurm job")
+			err := controller.slurmControl.TerminateJob(ctx, 3)
+			Expect(err).ToNot(HaveOccurred())
+
+			By("Reconciling")
+			err = controller.syncKubernetes(ctx, newRequest("crashloop"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Check pod existence")
+			key := types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: "crashloop"}
+			pod := &corev1.Pod{}
+			err = controller.Get(ctx, key, pod)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("Should not terminate the pod while its job is running", func() {
+			By("Reconciling")
+			err := controller.syncKubernetes(ctx, newRequest("crashloop"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Check pod existence")
+			key := types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: "crashloop"}
+			pod := &corev1.Pod{}
+			err = controller.Get(ctx, key, pod)
+			Expect(apierrors.IsNotFound(err)).ToNot(BeTrue())
+		})
+
+		It("Should terminate a bound pod whose job was requeued (stale binding)", func() {
+			By("Reconciling")
+			err := controller.syncKubernetes(ctx, newRequest("requeued-bound"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Check pod existence")
+			key := types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: "requeued-bound"}
+			pod := &corev1.Pod{}
+			err = controller.Get(ctx, key, pod)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+
+		It("Should terminate a pod whose job is suspended", func() {
+			By("Reconciling")
+			err := controller.syncKubernetes(ctx, newRequest("suspended"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Check pod existence")
+			key := types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: "suspended"}
+			pod := &corev1.Pod{}
+			err = controller.Get(ctx, key, pod)
+			Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		})
+	})
+
+	Context("With unbound pods", func() {
+		// Unbound pods are owned by the scheduler and never reconciled,
+		// whatever the state of their job (or lack of one).
+		It("Should not terminate a queued pod while its job is pending", func() {
+			By("Reconciling")
+			err := controller.syncKubernetes(ctx, newRequest("queued"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Check pod existence")
+			key := types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: "queued"}
+			pod := &corev1.Pod{}
+			err = controller.Get(ctx, key, pod)
+			Expect(apierrors.IsNotFound(err)).ToNot(BeTrue())
+		})
+
+		It("Should not terminate a queued pod whose job is gone", func() {
+			By("Reconciling")
+			err := controller.syncKubernetes(ctx, newRequest("queued-dead"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Check pod existence")
+			key := types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: "queued-dead"}
+			pod := &corev1.Pod{}
+			err = controller.Get(ctx, key, pod)
+			Expect(apierrors.IsNotFound(err)).ToNot(BeTrue())
+		})
+
+		It("Should not terminate an unlabeled queued pod", func() {
+			By("Reconciling")
+			err := controller.syncKubernetes(ctx, newRequest("unlabeled-queued"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Check pod existence")
+			key := types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: "unlabeled-queued"}
+			pod := &corev1.Pod{}
+			err = controller.Get(ctx, key, pod)
+			Expect(apierrors.IsNotFound(err)).ToNot(BeTrue())
+		})
+	})
+
+	Context("With a bound pod not labeled with a Slurm job", func() {
+		It("Should terminate the pod (orphan without a job)", func() {
+			By("Reconciling the orphan pod")
+			err := controller.syncKubernetes(ctx, newRequest("bar"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Check pod existence")
+			key := types.NamespacedName{Namespace: corev1.NamespaceDefault, Name: "bar"}
 			pod := &corev1.Pod{}
 			err = controller.Get(ctx, key, pod)
 			Expect(apierrors.IsNotFound(err)).To(BeTrue())
@@ -325,6 +505,48 @@ var _ = Describe("syncSlurm()", func() {
 			exists, err := controller.slurmControl.IsJobRunning(ctx, pod)
 			Expect(err).ToNot(HaveOccurred())
 			Expect(exists).To(BeFalse())
+		})
+
+		It("Should not terminate an already canceled job", func() {
+			By("Creating a terminal pod and canceled Slurm job")
+			podName := "canceled"
+			pod := newTerminalPod(podName, jobId)
+			jobList := &slurmtypes.V0044JobInfoList{
+				Items: []slurmtypes.V0044JobInfo{
+					{
+						V0044JobInfo: api.V0044JobInfo{
+							JobId:        ptr.To(jobId),
+							JobState:     &[]api.V0044JobInfoJobState{api.V0044JobInfoJobStateCANCELLED},
+							AdminComment: ptr.To(newExternalJobInfo(podName).ToString()),
+						},
+					},
+				},
+			}
+			terminateCalls := 0
+			c := slurmclientfake.NewClientBuilder().
+				WithLists(jobList).
+				WithInterceptorFuncs(slurminterceptor.Funcs{
+					Delete: func(context.Context, slurmobject.Object, ...slurmclient.DeleteOption) error {
+						terminateCalls++
+						return nil
+					},
+				}).
+				Build()
+			localController := &PodReconciler{
+				Client:        fake.NewFakeClient(pod),
+				Scheme:        scheme.Scheme,
+				SlurmClient:   c,
+				EventCh:       make(chan event.GenericEvent, 5),
+				slurmControl:  slurmcontrol.NewControl(c),
+				eventRecorder: record.NewFakeRecorder(10),
+			}
+
+			By("Reconciling")
+			err := localController.syncSlurm(ctx, newRequest(podName))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("Check job termination was not requested")
+			Expect(terminateCalls).To(BeZero())
 		})
 	})
 })

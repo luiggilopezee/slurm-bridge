@@ -5,13 +5,13 @@ package node
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/types"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog/v2"
 	"k8s.io/kubernetes/pkg/util/taints"
 	"k8s.io/utils/set"
@@ -20,10 +20,13 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	nodeutils "github.com/SlinkyProject/slurm-bridge/internal/controller/node/utils"
+	"github.com/SlinkyProject/slurm-bridge/internal/dra"
 	"github.com/SlinkyProject/slurm-bridge/internal/nodeinfo"
 	"github.com/SlinkyProject/slurm-bridge/internal/utils"
 	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 )
+
+const eventReasonOverlappingDRADeviceProfiles = "OverlappingDRADeviceProfiles"
 
 func (r *NodeReconciler) Sync(ctx context.Context, req reconcile.Request) error {
 	var errs []error
@@ -40,7 +43,7 @@ func (r *NodeReconciler) Sync(ctx context.Context, req reconcile.Request) error 
 		errs = append(errs, err)
 	}
 
-	return utilerrors.NewAggregate(errs)
+	return errors.Join(errs...)
 }
 
 // syncTaint will handle applying and removing the slurm-bridge taint on nodes.
@@ -64,33 +67,31 @@ func (r *NodeReconciler) syncTaint(ctx context.Context, req reconcile.Request) e
 	}
 	slurmNodeNameSet := set.New(slurmNodeNames...)
 
-	// Get Kubernetes Node Names for Slurm
-	kubeNodeList := &corev1.NodeList{}
-	if err := r.List(ctx, kubeNodeList); err != nil {
-		return err
-	}
-	kubeNodeNameMap := nodeutils.MakeNodeNameMap(ctx, kubeNodeList)
-	kubeNodeNameSet := set.New(utils.Keys(kubeNodeNameMap)...)
-
-	bridgedNodeNames := slurmNodeNameSet.Intersection(kubeNodeNameSet)
-	if bridgedNodeNames.Has(nodeutils.GetSlurmNodeName(node)) {
+	// `node` is by definition a Kubernetes node, so its own Slurm name is trivially a
+	// member of the set of all Kubernetes nodes' Slurm names; no need to list every
+	// Kubernetes node to compute that intersection.
+	if slurmNodeNameSet.Has(nodeutils.GetSlurmNodeName(node)) {
 		// Requeue until no longer a bridged node
 		durationStore.Push(node.Name, 30*time.Second)
 
 		// Taint bridged Kubernetes nodes
 		logger.V(1).Info("add taint to bridged node", "node", klog.KObj(node))
-		return r.taintNode(ctx, node, kubeNodeNameMap)
+		return r.taintNode(ctx, node)
 	} else {
 		// Untaint unbridged Kubernetes nodes
 		logger.V(1).Info("remove taint from non-bridged node", "node", klog.KObj(node))
-		return r.untaintNode(ctx, node, kubeNodeNameMap)
+		return r.untaintNode(ctx, node)
 	}
 }
 
-func (r *NodeReconciler) taintNode(ctx context.Context, node *corev1.Node, nodeNameMap map[string]string) error {
+func (r *NodeReconciler) taintNode(ctx context.Context, node *corev1.Node) error {
 	logger := log.FromContext(ctx)
 
-	name, ok := nodeNameMap[nodeutils.GetSlurmNodeName(node)]
+	name, ok, err := nodeutils.GetNodeNameForSlurmName(ctx, r.Client, nodeutils.GetSlurmNodeName(node))
+	if err != nil {
+		logger.Error(err, "failed to resolve node for Slurm name", "node", klog.KObj(node))
+		return err
+	}
 	if !ok {
 		name = node.GetName()
 	}
@@ -108,7 +109,7 @@ func (r *NodeReconciler) taintNode(ctx context.Context, node *corev1.Node, nodeN
 	// Add Node Taint
 	toUpdate = toUpdate.DeepCopy()
 	taint := utils.NewTaintNodeBridged(r.SchedulerName)
-	toUpdate, _, err := taints.AddOrUpdateTaint(toUpdate, taint)
+	toUpdate, _, err = taints.AddOrUpdateTaint(toUpdate, taint)
 	if err != nil {
 		logger.Error(err, "failed to add or update taint", "node", klog.KObj(node), "taint", taint)
 		return err
@@ -120,7 +121,7 @@ func (r *NodeReconciler) taintNode(ctx context.Context, node *corev1.Node, nodeN
 		logger.V(2).Info("node patch is empty, skipping patch request", "node", klog.KObj(node))
 		return nil
 	}
-	logger.Info("Remove taint from node", "node", klog.KObj(node))
+	logger.Info("Add taint to node", "node", klog.KObj(node))
 	if err := r.Patch(ctx, toUpdate, patch); err != nil {
 		logger.Error(err, "failed to patch node", "node", klog.KObj(node))
 		return err
@@ -128,10 +129,14 @@ func (r *NodeReconciler) taintNode(ctx context.Context, node *corev1.Node, nodeN
 	return nil
 }
 
-func (r *NodeReconciler) untaintNode(ctx context.Context, node *corev1.Node, nodeNameMap map[string]string) error {
+func (r *NodeReconciler) untaintNode(ctx context.Context, node *corev1.Node) error {
 	logger := log.FromContext(ctx)
 
-	name, ok := nodeNameMap[nodeutils.GetSlurmNodeName(node)]
+	name, ok, err := nodeutils.GetNodeNameForSlurmName(ctx, r.Client, nodeutils.GetSlurmNodeName(node))
+	if err != nil {
+		logger.Error(err, "failed to resolve node for Slurm name", "node", klog.KObj(node))
+		return err
+	}
 	if !ok {
 		name = node.GetName()
 	}
@@ -157,7 +162,7 @@ func (r *NodeReconciler) untaintNode(ctx context.Context, node *corev1.Node, nod
 		logger.V(2).Info("node patch is empty, skipping patch request", "node", klog.KObj(node))
 		return nil
 	}
-	logger.Info("Add taint to node", "node", klog.KObj(node))
+	logger.Info("Remove taint from node", "node", klog.KObj(node))
 	if err := r.Patch(ctx, toUpdate, patch); err != nil {
 		logger.Error(err, "failed to patch node", "node", klog.KObj(node))
 		return err
@@ -222,7 +227,7 @@ func (r *NodeReconciler) syncNodeRegistration(ctx context.Context, req reconcile
 	_, hasLabel := labels[wellknown.LabelExternalNode]
 
 	if hasLabel {
-		nodeInfo, err := nodeinfo.NewNodeInfo(ctx, r.Client, node.Name)
+		nodeInfo, draInventory, err := r.nodeRegistrationInventories(ctx, node)
 		if err != nil {
 			return err
 		}
@@ -231,7 +236,7 @@ func (r *NodeReconciler) syncNodeRegistration(ctx context.Context, req reconcile
 			return err
 		}
 		if exists {
-			needsRecreate, err := r.slurmControl.NodeNeedsRecreate(ctx, node, nodeInfo)
+			needsRecreate, err := r.slurmControl.NodeNeedsRecreate(ctx, node, nodeInfo, draInventory)
 			if err != nil {
 				return err
 			}
@@ -241,7 +246,7 @@ func (r *NodeReconciler) syncNodeRegistration(ctx context.Context, req reconcile
 				}
 			}
 		}
-		if err := r.slurmControl.AddNode(ctx, node, nodeInfo); err != nil {
+		if err := r.slurmControl.AddNode(ctx, node, nodeInfo, draInventory); err != nil {
 			return err
 		}
 	} else {
@@ -260,6 +265,31 @@ func (r *NodeReconciler) syncNodeRegistration(ctx context.Context, req reconcile
 	}
 
 	return nil
+}
+
+func (r *NodeReconciler) nodeRegistrationInventories(ctx context.Context, node *corev1.Node) (*nodeinfo.NodeInfo, []dra.GRESInventory, error) {
+	resourceSlices, err := nodeutils.GetResourceSlicesForNode(ctx, r.Client, node.Name)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	nodeInfo, err := nodeinfo.NewNodeInfoFromResourceSlices(node.Name, resourceSlices)
+	if err != nil {
+		return nil, nil, err
+	}
+	nodeInventory, err := dra.BuildNodeInventory(ctx, r.draRegistry, node, resourceSlices)
+	if err != nil {
+		var overlapErr *dra.OverlappingDeviceProfilesError
+		if r.eventRecorder != nil && errors.As(err, &overlapErr) {
+			r.eventRecorder.Event(node, corev1.EventTypeWarning, eventReasonOverlappingDRADeviceProfiles, overlapErr.Error())
+		}
+		return nil, nil, err
+	}
+	gresInventory, err := nodeInventory.GRES()
+	if err != nil {
+		return nil, nil, err
+	}
+	return nodeInfo, gresInventory, nil
 }
 
 func (r *NodeReconciler) removeNodeFromSlurmAfterDrain(ctx context.Context, req reconcile.Request, node *corev1.Node) error {

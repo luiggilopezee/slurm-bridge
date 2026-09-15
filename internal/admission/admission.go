@@ -6,10 +6,12 @@ package admission
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
+	"strings"
 
-	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
@@ -18,6 +20,11 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
+
+	"github.com/SlinkyProject/slurm-bridge/internal/dra"
+	"github.com/SlinkyProject/slurm-bridge/internal/nodeinfo"
+	"github.com/SlinkyProject/slurm-bridge/internal/utils/timelimit"
+	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 )
 
 type PodAdmission struct {
@@ -25,6 +32,14 @@ type PodAdmission struct {
 	SchedulerName            string
 	ManagedNamespaces        []string
 	ManagedNamespaceSelector *metav1.LabelSelector
+	DRARegistry              *dra.Registry
+}
+
+func (r *PodAdmission) draRegistry() *dra.Registry {
+	if r.DRARegistry != nil {
+		return r.DRARegistry
+	}
+	return dra.DefaultRegistry()
 }
 
 func (r *PodAdmission) SetupWebhookWithManager(mgr ctrl.Manager) error {
@@ -34,8 +49,8 @@ func (r *PodAdmission) SetupWebhookWithManager(mgr ctrl.Manager) error {
 		Complete()
 }
 
-// +kubebuilder:rbac:groups="",resources=namespaces,verbs=list;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;update;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups=resource.k8s.io,resources=deviceclasses,verbs=get;list;watch
 // +kubebuilder:webhook:path=/mutate--v1-pod,mutating=true,failurePolicy=fail,sideEffects=None,groups="",resources=pods,verbs=create;update,versions=v1,name=mcluster.kb.io,admissionReviewVersions=v1
 
 var _ admission.Defaulter[*corev1.Pod] = &PodAdmission{}
@@ -65,7 +80,7 @@ func (r *PodAdmission) Default(ctx context.Context, pod *corev1.Pod) error {
 	return nil
 }
 
-// +kubebuilder:webhook:path=/validate--v1-pod,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods,verbs=create;update,versions=v1,name=mcluster.kb.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate--v1-pod,mutating=false,failurePolicy=fail,sideEffects=None,groups="",resources=pods;pods/resize,verbs=create;update,versions=v1,name=mcluster.kb.io,admissionReviewVersions=v1
 
 var _ admission.Validator[*corev1.Pod] = &PodAdmission{}
 
@@ -88,6 +103,21 @@ func (r *PodAdmission) ValidateCreate(ctx context.Context, pod *corev1.Pod) (adm
 	if pod.Spec.ResourceClaims != nil {
 		return nil, fmt.Errorf("can't schedule a pod with a resourceclaim, use the annotation %s to request devices instead", wellknown.AnnotationGres)
 	}
+	if len(pod.Spec.TopologySpreadConstraints) > 0 {
+		return nil, fmt.Errorf("spec.topologySpreadConstraints is not supported by the slurm-bridge scheduler")
+	}
+	if err := validatePositiveResourceQuantities(pod); err != nil {
+		return nil, err
+	}
+	if err := r.validateDRAResources(ctx, pod); err != nil {
+		return nil, err
+	}
+	if err := validateAnnotationConflicts(pod); err != nil {
+		return nil, err
+	}
+	if err := validateTimeLimitAnnotation(pod); err != nil {
+		return nil, err
+	}
 	return nil, nil
 }
 
@@ -100,6 +130,19 @@ func (r *PodAdmission) ValidateUpdate(ctx context.Context, oldPod *corev1.Pod, n
 	}
 	if !isManaged && newPod.Spec.SchedulerName != r.SchedulerName {
 		return nil, nil
+	}
+	req, err := admission.RequestFromContext(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("get admission request from context: %w", err)
+	}
+	if req.SubResource == "resize" {
+		return nil, fmt.Errorf("can't resize a Slurm Bridge-managed pod")
+	}
+	if err := r.validateDRAResources(ctx, newPod); err != nil {
+		return nil, err
+	}
+	if err := validateAnnotationConflicts(newPod); err != nil {
+		return nil, err
 	}
 	// Once a pod has been placed by the Slurm bridge scheduler the jobid and
 	// node annotations should not be modified.
@@ -142,4 +185,160 @@ func (r *PodAdmission) isManagedNamespace(ctx context.Context, namespace string)
 		return false, nil
 	}
 	return slices.Contains(r.ManagedNamespaces, namespace), nil
+}
+
+func podRequestsNativeCPU(pod *corev1.Pod) bool {
+	containers := slices.Clone(pod.Spec.InitContainers)
+	containers = append(containers, pod.Spec.Containers...)
+
+	if pod.Spec.Resources != nil {
+		if resourceIsSet(*pod.Spec.Resources, corev1.ResourceCPU) {
+			return true
+		}
+	}
+	for _, container := range containers {
+		if resourceIsSet(container.Resources, corev1.ResourceCPU) {
+			return true
+		}
+	}
+	return false
+}
+
+func resourceIsSet(resources corev1.ResourceRequirements, name corev1.ResourceName) bool {
+	_, requested := resources.Requests[name]
+	_, limited := resources.Limits[name]
+	return requested || limited
+}
+
+func validatePositiveResourceQuantities(pod *corev1.Pod) error {
+	if pod.Spec.Resources != nil {
+		if err := validatePositiveResourceRequirements(*pod.Spec.Resources, "pod"); err != nil {
+			return err
+		}
+	}
+	containers := slices.Concat(pod.Spec.InitContainers, pod.Spec.Containers)
+	for _, container := range containers {
+		if err := validatePositiveResourceRequirements(container.Resources, fmt.Sprintf("container %q", container.Name)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validatePositiveResourceRequirements(resources corev1.ResourceRequirements, owner string) error {
+	for _, resourceList := range []struct {
+		field string
+		list  corev1.ResourceList
+	}{
+		{field: "request", list: resources.Requests},
+		{field: "limit", list: resources.Limits},
+	} {
+		for resourceName, quantity := range resourceList.list {
+			name := resourceName.String()
+			if resourceName != corev1.ResourceCPU && !strings.HasPrefix(name, resourcev1.ResourceDeviceClassPrefix) {
+				continue
+			}
+			if quantity.Sign() <= 0 {
+				return fmt.Errorf("%s resource %s %q must be greater than zero", owner, resourceList.field, resourceName)
+			}
+		}
+	}
+	return nil
+}
+
+func (r *PodAdmission) validateDRAResources(ctx context.Context, pod *corev1.Pod) error {
+	classNames := make(map[string]struct{})
+	containers := slices.Clone(pod.Spec.InitContainers)
+	containers = append(containers, pod.Spec.Containers...)
+	for _, container := range containers {
+		for resourceName := range container.Resources.Requests {
+			addDeviceClassName(classNames, resourceName)
+		}
+		for resourceName := range container.Resources.Limits {
+			addDeviceClassName(classNames, resourceName)
+		}
+	}
+
+	registry := r.draRegistry()
+	hasNativeCPU := podRequestsNativeCPU(pod)
+	for _, className := range slices.Sorted(maps.Keys(classNames)) {
+		deviceClass := &resourcev1.DeviceClass{}
+		if err := r.Get(ctx, client.ObjectKey{Name: className}, deviceClass); err != nil {
+			return fmt.Errorf("get device class %q: %w", className, err)
+		}
+		// TODO: Persist the admitted DeviceProfile if DeviceClasses may be repointed
+		// while a workload is scheduling. The current flow assumes DeviceClass
+		// selectors remain stable and re-resolves them during scheduling.
+		profile, err := registry.MatchDeviceClass(deviceClass)
+		if err != nil {
+			return err
+		}
+		if profile.UsesCoreBitmap() && hasNativeCPU {
+			return fmt.Errorf("can't specify both native %q and core-bitmap DeviceClass %q", corev1.ResourceCPU, className)
+		}
+	}
+	return nil
+}
+
+func addDeviceClassName(classNames map[string]struct{}, resourceName corev1.ResourceName) {
+	name := string(resourceName)
+	if !strings.HasPrefix(name, resourcev1.ResourceDeviceClassPrefix) {
+		return
+	}
+	classNames[strings.TrimPrefix(name, resourcev1.ResourceDeviceClassPrefix)] = struct{}{}
+}
+
+// validateTimeLimitAnnotation rejects a time limit the scheduler would fail to
+// parse, so the user sees the error from kubectl apply rather than from a job
+// that never schedules. A time limit set on an owning workload instead of the
+// pod template is not visible here and is still only caught during translation.
+func validateTimeLimitAnnotation(pod *corev1.Pod) error {
+	if value, ok := pod.Annotations[wellknown.AnnotationTimeLimit]; ok {
+		if _, err := timelimit.Parse(value); err != nil {
+			return fmt.Errorf("annotation %q: %w", wellknown.AnnotationTimeLimit, err)
+		}
+	}
+	return nil
+}
+
+// validateAnnotationConflicts rejects Slurm annotation overrides that would
+// contradict explicit DRA resource requests declared on the pod. DRA requests
+// are authoritative: the generated ResourceClaim must match what the pod
+// declared, so annotations that would replace those values are disallowed.
+func validateAnnotationConflicts(pod *corev1.Pod) error {
+	_, hasCpuPerTask := pod.Annotations[wellknown.AnnotationCpuPerTask]
+	_, hasGres := pod.Annotations[wellknown.AnnotationGres]
+	if !hasCpuPerTask && !hasGres {
+		return nil
+	}
+
+	checkResourceList := func(rl corev1.ResourceList) error {
+		for resourceName := range rl {
+			cls, isDRA := strings.CutPrefix(string(resourceName), resourcev1.ResourceDeviceClassPrefix)
+			if !isDRA {
+				continue
+			}
+			if hasCpuPerTask && cls == nodeinfo.DraDriverCpu {
+				return fmt.Errorf("annotation %q conflicts with CPU DRA resource %q: explicit DRA requests are authoritative",
+					wellknown.AnnotationCpuPerTask, resourceName)
+			}
+			if hasGres && cls != nodeinfo.DraDriverCpu {
+				return fmt.Errorf("annotation %q conflicts with DRA resource %q: explicit DRA requests are authoritative",
+					wellknown.AnnotationGres, resourceName)
+			}
+		}
+		return nil
+	}
+
+	for _, containers := range [][]corev1.Container{pod.Spec.InitContainers, pod.Spec.Containers} {
+		for _, c := range containers {
+			if err := checkResourceList(c.Resources.Requests); err != nil {
+				return err
+			}
+			if err := checkResourceList(c.Resources.Limits); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }

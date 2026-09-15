@@ -16,10 +16,24 @@ scheduler:
   image:
     repository: ghcr.io/slinkyproject/slurm-bridge-scheduler
     tag: ""
+    # -- Image pull policy.
+    pullPolicy: IfNotPresent
   # -- Set the number of replicas to deploy.
   replicaCount: 1
+  # -- PodDisruptionBudget for the scheduler deployment
+  pdb:
+    # -- Enable PodDisruptionBudget
+    enabled: false
   # -- Enables leader election.
   leaderElect: false
+  # -- Scheduler feature gates. SlurmBridgeGenericWorkload requires a supported
+  # built-in Workload and PodGroup API at startup; disable it for clusters without
+  # those APIs. It is independent of Kubernetes' GenericWorkload feature gate.
+  featureGates:
+    DRAExtendedResource: true
+    DynamicResourceAllocation: true
+    SchedulerPopFromBackoffQ: false
+    SlurmBridgeGenericWorkload: true
   # -- Set the priority class to use.
   # Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/#priorityclass
   priorityClassName: ""
@@ -64,6 +78,8 @@ admission:
   image:
     repository: ghcr.io/slinkyproject/slurm-bridge-admission
     tag: ""
+    # -- Image pull policy.
+    pullPolicy: IfNotPresent
   # Cert-Manager certificate configurations.
   certManager:
     # -- Enables cert-manager for certificate management.
@@ -74,6 +90,15 @@ admission:
     renewBefore: 8760h0m0s # 1 year
   # -- Set the number of replicas to deploy.
   replicas: 1
+  # -- PodDisruptionBudget for the admission deployment
+  pdb:
+    # -- Enable PodDisruptionBudget. Only rendered when `replicas` is greater
+    # than 1, since a PDB over a single replica blocks node drains.
+    enabled: false
+     # -- Minimum pods that must remain available after eviction (int or quoted percent).
+    minAvailable: 1
+    # -- Maximum pods that may be unavailable (int or quoted percent). Rendered only when set, and takes precedence over `minAvailable`.
+    maxUnavailable: null
   # -- Set the priority class to use.
   # Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/#priorityclass
   priorityClassName: ""
@@ -113,8 +138,21 @@ controllers:
   image:
     repository: ghcr.io/slinkyproject/slurm-bridge-controllers
     tag: ""
+    # -- Image pull policy.
+    pullPolicy: IfNotPresent
   # -- Set the number of replicas to deploy.
   replicas: 1
+  # -- Enables leader election.
+  leaderElect: false
+  # -- PodDisruptionBudget for the controllers deployment
+  pdb:
+    # -- Enable PodDisruptionBudget. Only rendered when `replicas` is greater
+    # than 1, since a PDB over a single replica blocks node drains.
+    enabled: false
+     # -- Minimum pods that must remain available after eviction (int or quoted percent).
+    minAvailable: 1
+    # -- Maximum pods that may be unavailable (int or quoted percent). Rendered only when set, and takes precedence over `minAvailable`.
+    maxUnavailable: null
   # -- Set the priority class to use.
   # Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/#priorityclass
   priorityClassName: ""
@@ -143,5 +181,45 @@ controllers:
 sharedConfig:
   # -- The Slurm REST API URL in the form of: `[protocol]://[host]:[port]`
   slurmRestApi: http://slurm-restapi.slurm:6820
-  # -- The secret containing a SLURM_JWT token for authentication.
+  # -- DRA DeviceProfiles recognized by Slurm Bridge. A DeviceClass resolves to
+  # a profile when its single CEL selector exactly matches `selector`.
+  # `name` becomes the Slurm GRES type and must remain stable while allocations
+  # using the profile exist. `driver` must be a Kubernetes DRA driver name and
+  # `backend.type` must be `core-bitmap` or `indexed-gres`; indexed GRES names
+  # must be DNS-1123 labels of at most 60 characters. Leave this `null` to use
+  # the built-in profiles shown below, or set it to `[]` to disable all
+  # DeviceProfiles explicitly.
+  deviceProfiles: null
+  # deviceProfiles:
+  #   - name: cpu
+  #     driver: dra.cpu
+  #     selector: device.driver == "dra.cpu"
+  #     backend:
+  #       type: core-bitmap
+  #   - name: gpu-example
+  #     driver: gpu.example.com
+  #     selector: device.driver == 'gpu.example.com'
+  #     backend:
+  #       type: indexed-gres
+  #       gresName: gpu
+  #   - name: gpu-nvidia
+  #     driver: gpu.nvidia.com
+  #     selector: >-
+  #       device.driver == 'gpu.nvidia.com' &&
+  #       device.attributes['gpu.nvidia.com'].type == 'gpu'
+  #     backend:
+  #       type: indexed-gres
+  #       gresName: gpu
+  #   - name: dranet-rdma
+  #     driver: dra.net
+  #     selector: >-
+  #       device.driver == 'dra.net' &&
+  #       has(device.attributes['dra.net'].pciAddress) &&
+  #       has(device.attributes['dra.net'].rdma) &&
+  #       device.attributes['dra.net'].rdma == true
+  #     backend:
+  #       type: indexed-gres
+  #       gresName: nic
+  # -- The Secret containing the Slurm JWT in the `auth-token` key. The token is
+  # mounted and read before each Slurm REST API request to support rotation.
   slurmJwtSecret: slurm-bridge-token

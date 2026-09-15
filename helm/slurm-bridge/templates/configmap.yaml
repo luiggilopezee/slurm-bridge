@@ -7,7 +7,7 @@ apiVersion: v1
 kind: ConfigMap
 metadata:
   name: slurm-bridge-config
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "slurm-bridge.namespace" . }}
   labels:
     {{- include "slurm-bridge.labels" . | nindent 4 }}
 data:
@@ -25,3 +25,5 @@ data:
     {{- end }}
     mcsLabel: {{ .Values.schedulerConfig.mcsLabel }}
     partition: {{ .Values.schedulerConfig.partition }}
+    deviceProfiles:
+      {{- toYaml .Values.sharedConfig.deviceProfiles | nindent 6 }}

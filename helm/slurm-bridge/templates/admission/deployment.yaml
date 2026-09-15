@@ -8,7 +8,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "slurm-bridge.admission.name" . }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "slurm-bridge.namespace" . }}
   labels:
     {{- include "slurm-bridge.admission.labels" . | nindent 4 }}
 spec:
@@ -20,6 +20,8 @@ spec:
     metadata:
       labels:
         {{- include "slurm-bridge.admission.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
     spec:
       {{- with .Values.admission.priorityClassName }}
       priorityClassName: {{ . }}
@@ -31,13 +33,7 @@ spec:
       containers:
         - name: {{ include "slurm-bridge.admission.name" . }}
           image: {{ include "slurm-bridge.admission.imageRef" . }}
-          imagePullPolicy: IfNotPresent
-          env:
-            - name: SLURM_JWT
-              valueFrom:
-                secretKeyRef:
-                  name: {{ .Values.sharedConfig.slurmJwtSecret }}
-                  key: auth-token
+          imagePullPolicy: {{ .Values.admission.image.pullPolicy }}
           livenessProbe:
             httpGet:
               path: /healthz
@@ -45,16 +41,10 @@ spec:
             initialDelaySeconds: 15
           readinessProbe:
             httpGet:
-              path: /healthz
+              path: /readyz
               port: 8081
           {{- with .Values.admission.resources }}
           resources: {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with .Values.admission.nodeSelector }}
-          nodeSelector: {{- toYaml . | nindent 12 }}
-          {{- end }}
-          {{- with .Values.admission.affinity }}
-          affinity: {{- toYaml . | nindent 12 }}
           {{- end }}
           volumeMounts:
             - name: certificates
@@ -63,6 +53,12 @@ spec:
             - name: slurm-bridge-config
               mountPath: /etc/slurm-bridge/
               readOnly: true
+      {{- with .Values.admission.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.admission.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.admission.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}

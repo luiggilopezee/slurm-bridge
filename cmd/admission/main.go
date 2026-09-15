@@ -8,20 +8,15 @@ import (
 	"flag"
 	"os"
 
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
-
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
-
-	// +kubebuilder:scaffold:imports
 
 	"github.com/SlinkyProject/slurm-bridge/internal/admission"
 	"github.com/SlinkyProject/slurm-bridge/internal/config"
@@ -95,13 +90,23 @@ func main() {
 		setupLog.Error(err, "unable to read config file", "file", flags.configFile)
 		os.Exit(1)
 	}
-	cfg := config.UnmarshalOrDie(data)
+	cfg, err := config.Unmarshal(data)
+	if err != nil {
+		setupLog.Error(err, "unable to parse config file", "file", flags.configFile)
+		os.Exit(1)
+	}
+	draRegistry, err := cfg.DRARegistry()
+	if err != nil {
+		setupLog.Error(err, "unable to configure DRA device profiles")
+		os.Exit(1)
+	}
 
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme: scheme,
 		Metrics: server.Options{
-			BindAddress: "0",
-			TLSOpts:     tlsOpts,
+			BindAddress:   flags.metricsAddr,
+			SecureServing: flags.secureMetrics,
+			TLSOpts:       tlsOpts,
 		},
 		WebhookServer: webhook.NewServer(webhook.Options{
 			TLSOpts: tlsOpts,
@@ -120,7 +125,7 @@ func main() {
 		setupLog.Error(err, "unable to set up health check")
 		os.Exit(1)
 	}
-	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+	if err := mgr.AddReadyzCheck("readyz", mgr.GetWebhookServer().StartedChecker()); err != nil {
 		setupLog.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
@@ -129,6 +134,7 @@ func main() {
 		ManagedNamespaces:        cfg.ManagedNamespaces,
 		ManagedNamespaceSelector: cfg.ManagedNamespaceSelector,
 		SchedulerName:            cfg.SchedulerName,
+		DRARegistry:              draRegistry,
 	}
 	if err := podAdmission.SetupWebhookWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create webhook", "webhook", "Pod")

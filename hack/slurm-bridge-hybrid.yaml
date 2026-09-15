@@ -1,0 +1,50 @@
+---
+configFiles:
+  gres.conf: |
+    Name=gpu Type=gpu-example File=/dev/tty[10-13] Count=4
+    Name=gpu Type=gpu-nvidia File=/dev/tty[20-27] Count=8
+    # DRANET injects the interface; this file gives Slurm a stable fixture index.
+    Name=nic Type=dranet0 File=/dev/null Count=1
+  topology.yaml: |
+    ---
+    - topology: topo-switch
+      cluster_default: true
+      tree:
+        switches:
+          - switch: sw_root
+            children: s[1-2]
+          - switch: s1
+          - switch: s2
+controller:
+  extraConf: |
+    GresTypes=gpu,nic
+    MCSPlugin=mcs/label
+    MCSParameters=ondemand,ondemandselect
+nodesets:
+  slinky:
+    enabled: false
+  slurm-bridge:
+    enabled: true
+    scalingMode: DaemonSet
+    slurmd:
+      env: []
+      args: []
+      resources: {}
+      volumeMounts: []
+    logfile:
+      image:
+        repository: docker.io/library/alpine
+        tag: latest
+      resources: {}
+    extraConf: Gres=gpu:gpu-example:4,gpu:gpu-nvidia:8,nic:dranet0:1
+    partition:
+      enabled: true
+    podSpec:
+      nodeSelector:
+        scheduler.slinky.slurm.net/slurm-bridge: worker
+        kubernetes.io/os: linux
+      tolerations:
+        - key: slinky.slurm.net/managed-node
+          operator: Equal
+          value: slurm-bridge-scheduler
+          effect: NoExecute

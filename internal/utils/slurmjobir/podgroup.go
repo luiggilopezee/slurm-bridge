@@ -5,122 +5,174 @@ package slurmjobir
 
 import (
 	"errors"
+	"fmt"
 
-	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/apimachinery/pkg/types"
 	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	sched "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
+	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+
+	"github.com/SlinkyProject/slurm-bridge/internal/features"
+	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 )
 
 var (
-	// Ref: https://github.com/kubernetes-sigs/scheduler-plugins/blob/master/kep/42-podgroup-coscheduling/README.md
-	podGroup_v1alpha1 = metav1.TypeMeta{APIVersion: "scheduling.x-k8s.io/v1alpha1", Kind: "PodGroup"}
-
 	ErrorPodGroupCouldNotGet = errors.New("could not get podgroup")
-	ErrorPodGroupRunning     = errors.New("PodGroup status is Running")
-	ErrorPodGroupUnknown     = errors.New("PodGroup status is Unknown")
-	ErrorPodGroupFailed      = errors.New("PodGroup status is Failed")
-	ErrorPodGroupFinished    = errors.New("PodGroup status is Finished")
+	ErrorPodGroupNoPods      = errors.New("no pods for scheduling group found")
 )
 
-// PreFilter performs PodGroup specific PreFilter functions
+func podGroupName(pod *corev1.Pod) (string, bool) {
+	if pod.Spec.SchedulingGroup == nil || pod.Spec.SchedulingGroup.PodGroupName == nil {
+		return "", false
+	}
+	name := *pod.Spec.SchedulingGroup.PodGroupName
+	return name, name != ""
+}
+
+// ValidatePodGroupSupport rejects built-in PodGroup references when the bridge
+// feature is disabled. Legacy scheduler-plugins PodGroups remain supported.
+func ValidatePodGroupSupport(api *WorkloadAPI, pod *corev1.Pod) error {
+	if _, grouped := podGroupName(pod); grouped && api == nil {
+		return fmt.Errorf("pod %s/%s uses spec.schedulingGroup but built-in Workload support is disabled; enable --feature-gates=%s=true on a cluster serving a supported Workload and PodGroup API", pod.Namespace, pod.Name, features.SlurmBridgeGenericWorkload)
+	}
+	return nil
+}
+
+// parsePodGroupSlurmAnnotations merges Slurm annotations from the PodGroup,
+// selected controller, and Workload. Only one controller source is applied.
+// Ref: https://kubernetes.io/docs/concepts/workloads/podgroup-api/
+func (t *translator) parsePodGroupSlurmAnnotations(
+	slurmJobIR *SlurmJobIR,
+	pg *PodGroup,
+	controllerPOM *metav1.PartialObjectMetadata,
+) error {
+	if err := parseAnnotations(slurmJobIR, pg.GetAnnotations()); err != nil {
+		return err
+	}
+	if controllerPOM != nil {
+		ann := controllerPOM.GetAnnotations()
+		if controllerPOM.Kind == "Job" {
+			job := &batchv1.Job{}
+			if err := t.Get(t.ctx, client.ObjectKeyFromObject(controllerPOM), job); err == nil {
+				ann = job.GetAnnotations()
+			}
+		} else if controllerPOM.TypeMeta == jobSet_v1alpha2 {
+			jobSet := &jobset.JobSet{}
+			if err := t.Get(t.ctx, client.ObjectKeyFromObject(controllerPOM), jobSet); err == nil {
+				ann = jobSet.GetAnnotations()
+			}
+		}
+		if err := parseAnnotations(slurmJobIR, ann); err != nil {
+			return err
+		}
+	}
+	workloadName := pg.workloadName()
+	if workloadName == "" {
+		return nil
+	}
+	key := client.ObjectKey{Namespace: pg.GetNamespace(), Name: workloadName}
+	wl := &Workload{TypeMeta: metav1.TypeMeta{APIVersion: t.workloadAPI.PodGroupTypeMeta.APIVersion, Kind: "Workload"}}
+	if err := t.Get(t.ctx, key, wl); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return err
+	}
+	return parseAnnotations(slurmJobIR, wl.GetAnnotations())
+}
+
+// applySlurmAnnotations merges Slurm job annotations for the scheduling root object.
+func (t *translator) applySlurmAnnotations(
+	slurmJobIR *SlurmJobIR,
+	pod *corev1.Pod,
+	rootPOM *metav1.PartialObjectMetadata,
+	pg *PodGroup,
+) error {
+	if pg == nil {
+		return parseAnnotations(slurmJobIR, rootPOM.Annotations)
+	}
+	if !isBuiltInPodGroup(slurmJobIR.RootPOM.TypeMeta) {
+		// Basic scheduling retains the original root and its annotations.
+		return t.parsePodGroupSlurmAnnotations(slurmJobIR, pg, rootPOM)
+	}
+	c, ok := t.Reader.(client.Client)
+	if !ok {
+		return fmt.Errorf("client does not support owner metadata lookup")
+	}
+	controllerPOM, err := getRootOwnerMetadata(c, t.ctx, pod)
+	if err != nil {
+		return err
+	}
+	return t.parsePodGroupSlurmAnnotations(slurmJobIR, pg, controllerPOM)
+}
+
+func schedulingGroupsMatch(a, b *corev1.PodSchedulingGroup) bool {
+	if a == nil || b == nil {
+		return false
+	}
+	if a.PodGroupName == nil || b.PodGroupName == nil {
+		return false
+	}
+	return *a.PodGroupName == *b.PodGroupName
+}
+
+// PreFilterPodGroup enforces gang scheduling MinCount (and external-job consistency)
+// for pods that reference a scheduling.k8s.io PodGroup via spec.schedulingGroup.
 func (t *translator) PreFilterPodGroup(pod *corev1.Pod, slurmJobIR *SlurmJobIR) *fwk.Status {
-	podGroup := &sched.PodGroup{}
 	key := client.ObjectKey{Namespace: slurmJobIR.RootPOM.GetNamespace(), Name: slurmJobIR.RootPOM.GetName()}
-	if err := t.Get(t.ctx, key, podGroup); err != nil {
+	pg := &PodGroup{TypeMeta: t.workloadAPI.PodGroupTypeMeta}
+	if err := t.Get(t.ctx, key, pg); err != nil {
 		return fwk.NewStatus(fwk.Error, ErrorPodGroupCouldNotGet.Error())
 	}
-
-	// If the PodGroup is in a state other than Running or Scheduling the pod will not
-	// be evaluated by the SlurmBridge scheduler.
-	switch podGroup.Status.Phase {
-	case sched.PodGroupRunning:
-		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, ErrorPodGroupRunning.Error())
-	case sched.PodGroupUnknown:
-		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, ErrorPodGroupUnknown.Error())
-	case sched.PodGroupFailed:
-		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, ErrorPodGroupFailed.Error())
-	case sched.PodGroupFinished:
-		return fwk.NewStatus(fwk.UnschedulableAndUnresolvable, ErrorPodGroupFinished.Error())
+	minCount := pg.gangMinCount()
+	if minCount == nil {
+		return fwk.NewStatus(fwk.Success)
 	}
-
-	// Ensure there are enough pods to satisfy MinMembers. Don't count pods
-	// that may already have an external job annotation.
-	numPodsWaiting := 0
+	var numPodsWaiting int32
 	for _, p := range slurmJobIR.Pods.Items {
-		if p.Labels[wellknown.LabelExternalJobId] ==
-			pod.Labels[wellknown.LabelExternalJobId] {
+		if p.Labels[wellknown.LabelExternalJobId] == pod.Labels[wellknown.LabelExternalJobId] {
 			numPodsWaiting++
 		}
 	}
-
-	// If the pod has no external job return an error to wait for more to be created.
-	// If the pod had an external job and now MinMember can no longer be satisfied because
-	// one or more pods were deleted after submitting the external job, return an error
-	// to indicate external job cleanup must occur.
-	if numPodsWaiting < int(podGroup.Spec.MinMember) {
+	if numPodsWaiting < *minCount {
 		if pod.Labels[wellknown.LabelExternalJobId] == "" {
 			return fwk.NewStatus(fwk.Error, ErrorInsuffientPods.Error())
-		} else {
-			return fwk.NewStatus(fwk.Error, ErrorExternalJobInvalid.Error())
 		}
+		return fwk.NewStatus(fwk.Error, ErrorExternalJobInvalid.Error())
 	}
 	return fwk.NewStatus(fwk.Success)
 }
 
-// GetPodGroup returns the PodGroup that a Pod belongs to in cache.
-func (t *translator) GetPodGroup(pod *corev1.Pod) (string, *sched.PodGroup) {
-	pgName := pod.Labels[sched.PodGroupLabel]
-	if len(pgName) == 0 {
-		return "", nil
-	}
-	pg := &sched.PodGroup{}
-	key := types.NamespacedName{Namespace: pod.Namespace, Name: pgName}
-	if err := t.Get(t.ctx, key, pg); err != nil {
-		return key.String(), nil
-	}
-	return key.String(), pg
-}
-
-// fromPodGroup will return a SlurmJobIR with the relevant PodGroup data translated
+// fromPodGroup builds SlurmJobIR for pods with spec.schedulingGroup.podGroupName set.
 func (t *translator) fromPodGroup(pod *corev1.Pod, rootPOM *metav1.PartialObjectMetadata) (*SlurmJobIR, error) {
-	podGroup := &sched.PodGroup{}
-	key := client.ObjectKey{Namespace: rootPOM.GetNamespace(), Name: rootPOM.GetName()}
-	if err := t.Get(t.ctx, key, podGroup); err != nil {
+	var allPods corev1.PodList
+	if err := t.List(t.ctx, &allPods, client.InNamespace(pod.Namespace)); err != nil {
 		return nil, err
 	}
-
 	slurmJobIR := &SlurmJobIR{}
-
-	if err := t.List(t.ctx, &slurmJobIR.Pods,
-		&client.ListOptions{LabelSelector: labels.SelectorFromSet(
-			labels.Set{sched.PodGroupLabel: pod.Labels[sched.PodGroupLabel]},
-		)}); err != nil {
-		return nil, err
+	ref := pod.Spec.SchedulingGroup
+	for i := range allPods.Items {
+		p := &allPods.Items[i]
+		if p.Spec.SchedulingGroup == nil {
+			continue
+		}
+		if schedulingGroupsMatch(p.Spec.SchedulingGroup, ref) {
+			slurmJobIR.Pods.Items = append(slurmJobIR.Pods.Items, *p)
+		}
+	}
+	if len(slurmJobIR.Pods.Items) == 0 {
+		return nil, ErrorPodGroupNoPods
 	}
 
-	if podGroup.Spec.MinResources.Memory().Value() != 0 {
-		val := GetMemoryFromQuantity(podGroup.Spec.MinResources.Memory())
-		slurmJobIR.JobInfo.MemPerNode = &val
-	}
-
-	if podGroup.Spec.MinResources.Cpu().Value() != 0 {
-		val := int32(podGroup.Spec.MinResources.Cpu().Value()) //nolint:gosec // disable G115
-		slurmJobIR.JobInfo.CpuPerTask = &val
-	}
-
-	if podGroup.Spec.MinMember > 0 {
-		slurmJobIR.JobInfo.MinNodes = &podGroup.Spec.MinMember
-	}
-
-	maxNodes := int32(len(slurmJobIR.Pods.Items)) //nolint:gosec // disable G115
-	slurmJobIR.JobInfo.MaxNodes = &maxNodes
-	tasksPerNode := int32(1)
-	slurmJobIR.JobInfo.TasksPerNode = &tasksPerNode
+	slurmJobIR.JobInfo.JobName = ptr.To(rootPOM.Name)
+	n := int32(len(slurmJobIR.Pods.Items)) //nolint:gosec // count bounded by cluster
+	slurmJobIR.JobInfo.MinNodes = ptr.To(n)
+	slurmJobIR.JobInfo.MaxNodes = ptr.To(n)
+	slurmJobIR.JobInfo.TasksPerNode = ptr.To(int32(1))
 
 	return slurmJobIR, nil
 }

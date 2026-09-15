@@ -9,7 +9,7 @@ metadata:
   labels:
     {{- include "slurm-bridge.scheduler.labels" . | nindent 4 }}
   name: {{ include "slurm-bridge.scheduler.name" . }}
-  namespace: {{ .Release.Namespace }}
+  namespace: {{ include "slurm-bridge.namespace" . }}
 spec:
   selector:
     matchLabels:
@@ -19,6 +19,9 @@ spec:
     metadata:
       labels:
         {{- include "slurm-bridge.scheduler.labels" . | nindent 8 }}
+      annotations:
+        checksum/config: {{ include (print $.Template.BasePath "/configmap.yaml") . | sha256sum }}
+        checksum/scheduler-config: {{ include (print $.Template.BasePath "/scheduler/configmap.yaml") . | sha256sum }}
     spec:
       {{- with .Values.scheduler.priorityClassName }}
       priorityClassName: {{ . }}
@@ -30,17 +33,19 @@ spec:
       containers:
       - args:
         - --config=/etc/kubernetes/scheduler-config.yaml
+        {{- $featureGates := list }}
+        {{- range $name, $enabled := .Values.scheduler.featureGates }}
+        {{- $featureGates = append $featureGates (printf "%s=%t" $name $enabled) }}
+        {{- end }}
+        - --feature-gates={{ join "," $featureGates }}
         {{- with .Values.scheduler.verbosity }}
         - --v={{ . }}
         {{- end }}
         env:
-        - name: SLURM_JWT
-          valueFrom:
-            secretKeyRef:
-              name: {{ .Values.sharedConfig.slurmJwtSecret }}
-              key: auth-token
+        - name: SLURM_JWT_FILE
+          value: /var/run/secrets/slurm/auth-token
         image: {{ include "slurm-bridge.scheduler.imageRef" . }}
-        imagePullPolicy: IfNotPresent
+        imagePullPolicy: {{ .Values.scheduler.image.pullPolicy }}
         livenessProbe:
           httpGet:
             path: /healthz
@@ -53,12 +58,6 @@ spec:
             path: /healthz
             port: 10259
             scheme: HTTPS
-        {{- with .Values.scheduler.nodeSelector }}
-        nodeSelector: {{- toYaml . | nindent 10 }}
-        {{- end }}
-        {{- with .Values.scheduler.affinity }}
-        affinity: {{- toYaml . | nindent 10 }}
-        {{- end }}
         {{- with .Values.scheduler.resources }}
         resources: {{- toYaml . | nindent 10 }}
         {{- end }}
@@ -71,8 +70,17 @@ spec:
         - name: slurm-bridge-config
           mountPath: /etc/slurm-bridge/
           readOnly: true
+        - name: slurm-jwt
+          mountPath: /var/run/secrets/slurm
+          readOnly: true
       hostNetwork: false
       hostPID: false
+      {{- with .Values.scheduler.nodeSelector }}
+      nodeSelector: {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.scheduler.affinity }}
+      affinity: {{- toYaml . | nindent 8 }}
+      {{- end }}
       {{- with .Values.scheduler.tolerations }}
       tolerations: {{- toYaml . | nindent 8 }}
       {{- end }}
@@ -83,3 +91,9 @@ spec:
       - name: slurm-bridge-config
         configMap:
           name: slurm-bridge-config
+      - name: slurm-jwt
+        secret:
+          secretName: {{ .Values.sharedConfig.slurmJwtSecret }}
+          items:
+          - key: auth-token
+            path: auth-token

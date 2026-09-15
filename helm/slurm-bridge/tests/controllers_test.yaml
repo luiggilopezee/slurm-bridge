@@ -1,0 +1,236 @@
+# SPDX-FileCopyrightText: Copyright (C) SchedMD LLC.
+# SPDX-License-Identifier: Apache-2.0
+---
+suite: test controllers
+templates:
+  - controllers/deployment.yaml
+  - controllers/poddisruptionbudget.yaml
+  - controllers/rbac.yaml
+  - controllers/service.yaml
+  - configmap.yaml
+release:
+  name: test-release
+  namespace: test-namespace
+chart:
+  version: 1.2.3
+  appVersion: 1.2.3
+tests:
+  - it: manifests should match snapshot
+    asserts:
+      - matchSnapshot: {}
+  - it: deployment carries a config checksum annotation so configmap changes trigger a rolling restart
+    template: controllers/deployment.yaml
+    asserts:
+      - isNotNullOrEmpty:
+          path: spec.template.metadata.annotations["checksum/config"]
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[0-9a-f]{64}$
+  - it: renders user-supplied DRA device profiles into shared configuration
+    template: configmap.yaml
+    set:
+      sharedConfig:
+        deviceProfiles:
+          - name: custom-accelerator
+            driver: accelerator.example.com
+            selector: device.driver == 'accelerator.example.com'
+            backend:
+              type: indexed-gres
+              gresName: accelerator
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?s)deviceProfiles:.*gresName: accelerator.*driver: accelerator.example.com.*name: custom-accelerator'
+  - it: renders a null registry by default so components use built-in profiles
+    template: configmap.yaml
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^\s*deviceProfiles:\s*null\s*$'
+  - it: preserves an explicitly empty DRA device profile registry
+    template: configmap.yaml
+    set:
+      sharedConfig.deviceProfiles: []
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: '(?m)^\s*deviceProfiles:\s*\[\]\s*$'
+  - it: image pull policy is configurable
+    template: controllers/deployment.yaml
+    set:
+      controllers.image.pullPolicy: Always
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].imagePullPolicy
+          value: Always
+  - it: exposes metrics over HTTP
+    template: controllers/service.yaml
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: metrics
+            protocol: TCP
+            port: 8080
+            targetPort: 8080
+  - it: leader election can be enabled
+    template: controllers/deployment.yaml
+    set:
+      controllers.leaderElect: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --leader-elect=true
+  - it: controllers can update their leader election lease
+    template: controllers/rbac.yaml
+    documentSelector:
+      path: kind
+      value: ClusterRole
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - coordination.k8s.io
+            resources:
+              - leases
+            verbs:
+              - create
+              - get
+              - list
+              - update
+  - it: controllers can record leader election events
+    template: controllers/rbac.yaml
+    documentSelector:
+      path: kind
+      value: ClusterRole
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - ""
+            resources:
+              - events
+            verbs:
+              - create
+              - patch
+  - it: applies the controllers resources to the controllers container
+    template: controllers/deployment.yaml
+    set:
+      controllers.resources:
+        requests:
+          cpu: 1
+          memory: 1Gi
+        limits:
+          cpu: 2
+          memory: 4Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 1
+              memory: 1Gi
+            limits:
+              cpu: 2
+              memory: 4Gi
+  - it: does not apply the admission resources to the controllers container
+    template: controllers/deployment.yaml
+    set:
+      admission.resources:
+        limits:
+          cpu: 9
+    asserts:
+      - isNull:
+          path: spec.template.spec.containers[0].resources
+  - it: pdb is not rendered for a single replica, which would block node drains
+    template: controllers/poddisruptionbudget.yaml
+    set:
+      controllers:
+        replicas: 1
+        pdb:
+          enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: pdb defaults to minAvailable when maxUnavailable is unset
+    template: controllers/poddisruptionbudget.yaml
+    set:
+      controllers:
+        replicas: 2
+        pdb:
+          enabled: true
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - notExists:
+          path: spec.maxUnavailable
+  - it: pdb maxUnavailable takes precedence over minAvailable
+    template: controllers/poddisruptionbudget.yaml
+    set:
+      controllers:
+        replicas: 2
+        pdb:
+          enabled: true
+          maxUnavailable: 1
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+      - notExists:
+          path: spec.minAvailable
+  - it: pdb accepts a quoted percentage for maxUnavailable
+    template: controllers/poddisruptionbudget.yaml
+    set:
+      controllers:
+        replicas: 2
+        pdb:
+          enabled: true
+          maxUnavailable: 50%
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 50%
+      - notExists:
+          path: spec.minAvailable
+  - it: pdb honors an explicit maxUnavailable of zero
+    template: controllers/poddisruptionbudget.yaml
+    set:
+      controllers:
+        replicas: 2
+        pdb:
+          enabled: true
+          maxUnavailable: 0
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 0
+      - notExists:
+          path: spec.minAvailable
+  - it: pdb falls back to minAvailable 1 when both bounds are null
+    template: controllers/poddisruptionbudget.yaml
+    set:
+      controllers:
+        replicas: 2
+        pdb:
+          enabled: true
+          minAvailable: null
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - notExists:
+          path: spec.maxUnavailable
+  - it: mounts the rotating Slurm JWT secret
+    template: controllers/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[0]
+          value:
+            name: SLURM_JWT_FILE
+            value: /var/run/secrets/slurm/auth-token
+      - equal:
+          path: spec.template.spec.volumes[1].secret.secretName
+          value: slurm-bridge-token

@@ -7,22 +7,22 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"reflect"
 	"slices"
 	"strconv"
 	"strings"
 
+	"github.com/puttsk/hostlist"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	"k8s.io/apimachinery/pkg/util/sets"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/klog/v2"
 	fwk "k8s.io/kube-scheduler/framework"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -30,15 +30,17 @@ import (
 	lws "sigs.k8s.io/lws/api/leaderworkerset/v1"
 	sched "sigs.k8s.io/scheduler-plugins/apis/scheduling/v1alpha1"
 
+	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
+	slurmtoken "github.com/SlinkyProject/slurm-client/pkg/client/token"
+
 	"github.com/SlinkyProject/slurm-bridge/internal/config"
 	nodecontrollerutils "github.com/SlinkyProject/slurm-bridge/internal/controller/node/utils"
+	"github.com/SlinkyProject/slurm-bridge/internal/dra"
+	"github.com/SlinkyProject/slurm-bridge/internal/features"
 	"github.com/SlinkyProject/slurm-bridge/internal/scheduler/plugins/slurmbridge/slurmcontrol"
 	"github.com/SlinkyProject/slurm-bridge/internal/utils"
 	"github.com/SlinkyProject/slurm-bridge/internal/utils/slurmjobir"
 	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
-	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
-
-	"github.com/puttsk/hostlist"
 )
 
 var (
@@ -47,57 +49,82 @@ var (
 	ErrorPodUpdateFailed      = errors.New("failed to update pod")
 	ErrorNodeConfigInvalid    = errors.New("requested node configuration is not available")
 	ErrorNoNodesAssigned      = errors.New("no nodes assigned to job")
+	ErrorJobNotPendingNoNodes = errors.New("external job is no longer pending but has no nodes assigned")
 	ErrorPodWithResourceClaim = errors.New("can't schedule pod with a resource claim")
 )
 
-func init() {
-	utilruntime.Must(scheme.AddToScheme(scheme.Scheme))
-	utilruntime.Must(sched.AddToScheme(scheme.Scheme))
-	utilruntime.Must(batchv1.AddToScheme(scheme.Scheme))
-	utilruntime.Must(jobset.AddToScheme(scheme.Scheme))
-	utilruntime.Must(lws.AddToScheme(scheme.Scheme))
+const slurmJobNotPending = "job is no longer pending execution"
+
+func findMatchingError(err error, matches func(error) bool) error {
+	if err == nil {
+		return nil
+	}
+	if matches(err) {
+		return err
+	}
+
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if match := findMatchingError(child, matches); match != nil {
+				return match
+			}
+		}
+		return nil
+	}
+
+	return findMatchingError(errors.Unwrap(err), matches)
 }
 
-// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+func isJobNotPendingError(err error) bool {
+	return findMatchingError(err, func(err error) bool {
+		msg := strings.ToLower(err.Error())
+		return strings.Contains(msg, slurmJobNotPending) ||
+			strings.Contains(msg, "eslurm_job_not_pending")
+	}) != nil
+}
+
+// Scheduler Plugin Core RBAC
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;update
-// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;patch;watch
-// +kubebuilder:rbac:groups="",resources=pods,verbs=delete;get;list;patch;watch
-// +kubebuilder:rbac:groups="",resources=pods/finalizers,verbs=patch;update
-// +kubebuilder:rbac:groups="",resources=pods/status,verbs=patch;update
-// +kubebuilder:rbac:groups="",resources=bindings,verbs=create
-// +kubebuilder:rbac:groups="",resources=pods/binding,verbs=create
-// +kubebuilder:rbac:groups="",resources=endpoints,verbs=create;get;update
-// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;update;watch
-// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;update;watch
-// +kubebuilder:rbac:groups="",resources=replicationcontrollers,verbs=get;list;watch
-// +kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;patch;watch
+// +kubebuilder:rbac:groups="",resources=pods/finalizers,verbs=patch
+// +kubebuilder:rbac:groups="",resources=pods/status,verbs=patch
 // +kubebuilder:rbac:groups=apps,resources=replicasets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch;update
 // +kubebuilder:rbac:groups=extensions,resources=replicasets,verbs=get;list;watch
-// +kubebuilder:rbac:groups=policy,resources=poddisruptionbudgets,verbs=get;list;watch
-// +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
-// +kubebuilder:rbac:groups=authentication.k8s.io,resources=subjectaccessreviews,verbs=create
-// +kubebuilder:rbac:groups=storage.k8s.io,resources=volumeattachments,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.k8s.io,resources=csinodes,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.k8s.io,resources=csidrivers,verbs=get;list;watch
-// +kubebuilder:rbac:groups=storage.k8s.io,resources=csistoragecapacities,verbs=get;list;watch
-// +kubebuilder:rbac:groups=topology.node.k8s.io,resources=noderesourcetopologies,verbs=get;list;watch
-// +kubebuilder:rbac:groups=resource.k8s.io,resources=deviceclasses,verbs=get;list;watch
-// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceslices,verbs=get;list;watch
-// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims,verbs=create;get;list;update;watch
-// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims,verbs=create;get;list;update;watch
-// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims/status,verbs=patch;update
-// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims/binding,verbs=patch;update
 
-// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=create;get;list;watch
-// +kubebuilder:rbac:groups=batch,resources=jobs/status,verbs=create;get;list;watch
-// +kubebuilder:rbac:groups=scheduling.x-k8s.io,resources=podgroups,verbs=create;get;list;watch
-// +kubebuilder:rbac:groups=scheduling.x-k8s.io,resources=podgroups/status,verbs=create;get;list;watch
-// +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets,verbs=create;get;list;watch
-// +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets/status,verbs=create;get;list;watch
-// +kubebuilder:rbac:groups=leaderworkerset.x-k8s.io,resources=leaderworkersets,verbs=create;get;list;watch
+// Delegated Auth RBAC
+// +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews,verbs=create
+// +kubebuilder:rbac:groups=authentication.k8s.io,resources=tokenreviews,verbs=create
+
+// RBAC for VolumeBinding Scheduler Plugin
+// +kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;update;watch
+// +kubebuilder:rbac:groups="",resources=persistentvolumes,verbs=get;list;update;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=csidrivers,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=csinodes,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=csistoragecapacities,verbs=get;list;watch
+// +kubebuilder:rbac:groups=storage.k8s.io,resources=storageclasses,verbs=get;list;watch
+
+// RBAC for DefaultBinder Scheduler Plugin
+// +kubebuilder:rbac:groups="",resources=pods/binding,verbs=create
+
+// RBAC for nodeinfo.go and dra.go
+// +kubebuilder:rbac:groups=resource.k8s.io,resources=deviceclasses,verbs=get;list;watch
+// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims,verbs=create;get;list;update;watch;delete
+// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims/binding,verbs=patch
+// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims/status,verbs=patch
+// +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceslices,verbs=get;list;watch
+
+// RBAC for Slurm-bridge Workloads
+// +kubebuilder:rbac:groups=scheduling.k8s.io,resources=workloads,verbs=get
+// +kubebuilder:rbac:groups=scheduling.x-k8s.io,resources=podgroups,verbs=get
+// +kubebuilder:rbac:groups=batch,resources=jobs,verbs=get
+// +kubebuilder:rbac:groups=jobset.x-k8s.io,resources=jobsets,verbs=get
+// +kubebuilder:rbac:groups=leaderworkerset.x-k8s.io,resources=leaderworkersets,verbs=get
+// +kubebuilder:rbac:groups=scheduling.k8s.io,resources=podgroups,verbs=get
+// +kubebuilder:rbac:groups=scheduling.k8s.io,resources=podgroups/status,verbs=patch;update
 
 // Slurmbridge is a plugin that schedules pods in a group.
 type SlurmBridge struct {
@@ -105,6 +132,8 @@ type SlurmBridge struct {
 	schedulerName string
 	slurmControl  slurmcontrol.SlurmControlInterface
 	handle        fwk.Handle
+	draRegistry   *dra.Registry
+	workloadAPI   *slurmjobir.WorkloadAPI
 }
 
 var _ fwk.PreEnqueuePlugin = &SlurmBridge{}
@@ -117,6 +146,10 @@ const (
 	Name                  = "SlurmBridge"
 	stateKey fwk.StateKey = Name
 )
+
+// ConfigFile is the path to the slurm-bridge config file read by New, overridable via
+// cmd/scheduler/main.go's "--slurm-bridge-config" flag.
+var ConfigFile = config.ConfigFile
 
 // Name returns name of the plugin. It is used in logs, etc.
 func (sb *SlurmBridge) Name() string {
@@ -143,34 +176,74 @@ func getStateData(cs fwk.CycleState) (*stateData, error) {
 	return s, nil
 }
 
+// activatePod will put the pod back into the scheduling queue.
+func (sb *SlurmBridge) activatePod(logger klog.Logger, pod *corev1.Pod) {
+	sb.handle.Activate(logger, map[string]*corev1.Pod{string(pod.UID): pod})
+}
+
+func newClientScheme() (*runtime.Scheme, error) {
+	scheme := runtime.NewScheme()
+	for name, addToScheme := range map[string]func(*runtime.Scheme) error{
+		"metadata":          metav1.AddMetaToScheme,
+		"core":              corev1.AddToScheme,
+		"batch":             batchv1.AddToScheme,
+		"resource":          resourcev1.AddToScheme,
+		"scheduler-plugins": sched.AddToScheme,
+		"jobset":            jobset.AddToScheme,
+		"leader-worker-set": lws.AddToScheme,
+	} {
+		if err := addToScheme(scheme); err != nil {
+			return nil, fmt.Errorf("register %s API scheme: %w", name, err)
+		}
+	}
+	return scheme, nil
+}
+
 // New initializes and returns a new Slurmbridge plugin.
 func New(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin, error) {
 
 	logger := klog.FromContext(ctx)
 	logger.V(5).Info("creating new SlurmBridge plugin")
 
-	data, err := os.ReadFile(config.ConfigFile)
+	data, err := os.ReadFile(ConfigFile)
 	if err != nil {
-		logger.Error(err, "unable to read config file", "file", config.ConfigFile)
-		// Attempt to read fallback debug config path
-		data, err = os.ReadFile("/tmp/config.yaml.debug")
-		if err != nil {
-			logger.Error(err, "unable to read config file", "file", config.ConfigFile)
-			return nil, err
-		}
+		logger.Error(err, "unable to read config file", "file", ConfigFile)
+		return nil, err
 	}
-	cfg := config.UnmarshalOrDie(data)
+	cfg, err := config.Unmarshal(data)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.ValidateScheduler(); err != nil {
+		return nil, err
+	}
+	draRegistry, err := cfg.DRARegistry()
+	if err != nil {
+		return nil, fmt.Errorf("configure DRA device profiles: %w", err)
+	}
 
-	client, err := client.New(handle.KubeConfig(), client.Options{})
+	clientScheme, err := newClientScheme()
+	if err != nil {
+		return nil, err
+	}
+	workloadAPI, err := newWorkloadAPI(handle.KubeConfig(), clientScheme)
+	if err != nil {
+		return nil, err
+	}
+	if workloadAPI != nil {
+		logger.Info("registered built-in Workload API", "apiVersion", workloadAPI.PodGroupTypeMeta.APIVersion)
+	} else {
+		logger.Info("built-in Workload support disabled", "featureGate", features.SlurmBridgeGenericWorkload)
+	}
+
+	kubeClient, err := newKubeClient(handle.KubeConfig(), clientScheme)
 	if err != nil {
 		return nil, err
 	}
 	clientConfig := &slurmclient.Config{
-		Server: cfg.SlurmRestApi,
-		AuthToken: func() string {
-			token, _ := os.LookupEnv("SLURM_JWT")
-			return token
-		}(),
+		Server:        cfg.SlurmRestApi,
+		TokenProvider: slurmtoken.FileProvider{Path: os.Getenv("SLURM_JWT_FILE")},
+		HTTPClient:    &http.Client{Timeout: config.SlurmClientTimeout},
 	}
 	slurmClient, err := slurmclient.NewClient(clientConfig)
 	if err != nil {
@@ -179,10 +252,12 @@ func New(ctx context.Context, obj runtime.Object, handle fwk.Handle) (fwk.Plugin
 	}
 	sc := slurmcontrol.NewControl(slurmClient, cfg.MCSLabel, cfg.Partition)
 	plugin := &SlurmBridge{
-		Client:        client,
+		Client:        kubeClient,
 		schedulerName: cfg.SchedulerName,
 		slurmControl:  sc,
 		handle:        handle,
+		draRegistry:   draRegistry,
+		workloadAPI:   workloadAPI,
 	}
 	return plugin, nil
 }
@@ -216,6 +291,10 @@ func (sb *SlurmBridge) PreFilter(ctx context.Context, state fwk.CycleState, pod 
 	logger := klog.FromContext(ctx)
 	var err error
 
+	if err := slurmjobir.ValidatePodGroupSupport(sb.workloadAPI, pod); err != nil {
+		return nil, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, err.Error())
+	}
+
 	if pod.Spec.ResourceClaims != nil {
 		logger.Error(ErrorPodWithResourceClaim, "use extended resource or device plugin request instead")
 		return nil, fwk.NewStatus(fwk.Unschedulable, ErrorPodWithResourceClaim.Error())
@@ -231,17 +310,32 @@ func (sb *SlurmBridge) PreFilter(ctx context.Context, state fwk.CycleState, pod 
 	}
 
 	// Construct an intermediate representation of the Slurm external job
-	s.slurmJobIR, err = slurmjobir.TranslateToSlurmJobIR(sb.Client, ctx, pod)
+	s.slurmJobIR, err = slurmjobir.TranslateToSlurmJobIR(sb.Client, sb.registry(), sb.workloadAPI, ctx, pod)
 	if err != nil {
 		return nil, fwk.NewStatus(fwk.Error, err.Error())
+	}
+	root := &s.slurmJobIR.RootPOM
+	rootName := root.Name
+	if root.Namespace != "" {
+		rootName = root.Namespace + "/" + root.Name
+	}
+	logger.V(3).Info("selected workload root",
+		"pod", klog.KObj(pod),
+		"apiVersion", root.APIVersion,
+		"kind", root.Kind,
+		"root", rootName)
+	if err := sb.validateDeviceClassRequestsForPods(ctx, s.slurmJobIR.Pods.Items); err != nil {
+		logger.Error(err, "unsupported DRA extended resource request")
+		return nil, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, err.Error())
 	}
 
 	// If an externalJob exists and a node has been allocated, return immediately
 	// as another pod has determined the external job is running and assigned
 	// a node to this pod.
 	node := pod.Annotations[wellknown.AnnotationExternalJobNode]
-	if pod.Labels[wellknown.LabelExternalJobId] != "" &&
-		node != "" {
+	jobID := pod.Labels[wellknown.LabelExternalJobId]
+	if jobID != "" && node != "" {
+		sb.markPodGroupScheduled(ctx, s.slurmJobIR, jobID)
 		phNode := make(sets.Set[string])
 		phNode.Insert(node)
 		return &fwk.PreFilterResult{NodeNames: phNode}, fwk.NewStatus(fwk.Success)
@@ -255,7 +349,7 @@ func (sb *SlurmBridge) PreFilter(ctx context.Context, state fwk.CycleState, pod 
 	}
 
 	// Perform resource specific PreFilter
-	fs := slurmjobir.PreFilter(sb.Client, ctx, pod, s.slurmJobIR)
+	fs := slurmjobir.PreFilter(sb.Client, sb.registry(), sb.workloadAPI, ctx, pod, s.slurmJobIR)
 	if fs.Code() != fwk.Success {
 		// If the external job is determined to no longer be valid
 		// delete the external job and remove the associated annotations
@@ -271,19 +365,18 @@ func (sb *SlurmBridge) PreFilter(ctx context.Context, state fwk.CycleState, pod 
 		return nil, fs
 	}
 
-	// If an external job does not exist, this plugin should return as a success
-	// with no PreFilterResult. Because Filter will ultimately detect that slurm
-	// has not scheduled any nodes to the pods (no node annotation), the PostFilter
-	// plugin will be invoked. The external job will then be created in the
-	// PostFilter plugin stage. If an external job exists and is running, update
-	// pods with node assignments.
+	// If no external job exists, or the external job exists but Slurm has not
+	// assigned nodes yet, return success with no PreFilterResult. Filter will
+	// detect the missing node annotation and PostFilter will create or update
+	// the external job. If the external job has nodes, annotate the pods so
+	// scheduling can continue against the Slurm allocation.
 	if externalJob.JobId == 0 {
 		return nil, fwk.NewStatus(fwk.Success)
 	} else {
 		logger.V(4).Info("external job exists")
 		if externalJob.Nodes == "" {
 			logger.V(4).Info("external job exists but no nodes have been allocated")
-			return nil, fwk.NewStatus(fwk.Pending, ErrorNoNodesAssigned.Error())
+			return nil, fwk.NewStatus(fwk.Success)
 		}
 		// The external job is running. Assign nodes to pods.
 		slurmNodes, _ := hostlist.Expand(externalJob.Nodes)
@@ -295,6 +388,7 @@ func (sb *SlurmBridge) PreFilter(ctx context.Context, state fwk.CycleState, pod 
 		if err != nil {
 			return nil, fwk.NewStatus(fwk.Error, err.Error())
 		}
+		sb.markPodGroupScheduled(ctx, s.slurmJobIR, strconv.Itoa(int(externalJob.JobId)))
 		// Update pod after performing a Patch so subsequent plugins have
 		// accurate annotations
 		if err := sb.Get(ctx, client.ObjectKeyFromObject(pod), pod); err != nil {
@@ -305,6 +399,22 @@ func (sb *SlurmBridge) PreFilter(ctx context.Context, state fwk.CycleState, pod 
 		// PreFilter step that must occur before pods are allowed to run.
 		return &fwk.PreFilterResult{NodeNames: kubeNodes}, fwk.NewStatus(fwk.Success, "")
 	}
+}
+
+// allocatedNodeRejectedByKubernetes returns true only when PreFilter observed a
+// Slurm allocation and a Kubernetes Filter plugin rejected the node assigned to
+// this pod. Without the node annotation, Slurm may have allocated the job after
+// PreFilter ran; that valid allocation must be preserved for the next cycle.
+func allocatedNodeRejectedByKubernetes(pod *corev1.Pod, externalJob *slurmcontrol.ExternalJob, m fwk.NodeToStatusReader) bool {
+	if externalJob.JobId == 0 || externalJob.Nodes == "" {
+		return false
+	}
+	assignedNode := pod.Annotations[wellknown.AnnotationExternalJobNode]
+	if assignedNode == "" {
+		return false
+	}
+	status := m.Get(assignedNode)
+	return status.Code() != fwk.Success && status.Plugin() != "" && status.Plugin() != Name
 }
 
 // PostFilter will create the Slurm external job once the pod has been
@@ -325,6 +435,15 @@ func (sb *SlurmBridge) PostFilter(ctx context.Context, state fwk.CycleState, pod
 		logger.Error(err, "error checking for Slurm job")
 		return nil, fwk.NewStatus(fwk.Error, err.Error())
 	}
+	if allocatedNodeRejectedByKubernetes(pod, externalJob, m) {
+		logger.Info("Slurm allocation rejected by Kubernetes, deleting external job for retry",
+			"pod", klog.KObj(pod), "jobId", externalJob.JobId, "nodes", externalJob.Nodes)
+		if err := sb.deleteExternalJob(ctx, pod); err != nil {
+			return nil, fwk.NewStatus(fwk.Error, err.Error())
+		}
+		sb.activatePod(logger, pod)
+		return nil, fwk.NewStatus(fwk.Success)
+	}
 
 	// Create the Slurm external job based on the nodes that have
 	// not been filtered out by Filter plugins. Because the SlurmBridge
@@ -337,6 +456,13 @@ func (sb *SlurmBridge) PostFilter(ctx context.Context, state fwk.CycleState, pod
 		logger.Error(err, "error getting nodes that SlurmBridge can use")
 		return nil, fwk.NewStatus(fwk.Error, err.Error())
 	}
+	slurmNodeNames, err := sb.slurmControl.GetNodeNames(ctx, s.slurmJobIR.JobInfo.Partition)
+	if err != nil {
+		logger.Error(err, "error getting Slurm nodes")
+		return nil, fwk.NewStatus(fwk.Error, err.Error())
+	}
+	slurmNodes := sets.New(slurmNodeNames...)
+	feasibleSlurmNodes := sets.New[string]()
 	for _, node := range feasibleNodes {
 		status := m.Get(node.Node().Name)
 		// If the Unschedulable code was set by SlurmBridge
@@ -345,33 +471,31 @@ func (sb *SlurmBridge) PostFilter(ctx context.Context, state fwk.CycleState, pod
 		// this node for consideration.
 		if status.Plugin() == Name {
 			slurmName := nodecontrollerutils.GetSlurmNodeName(node.Node())
-			if isSlurm, _ := sb.slurmControl.IsSlurmNode(ctx, slurmName); isSlurm {
-				s.slurmJobIR.JobInfo.Nodes = append(s.slurmJobIR.JobInfo.Nodes, slurmName)
+			if slurmNodes.Has(slurmName) {
+				feasibleSlurmNodes.Insert(slurmName)
 			}
 		}
 	}
 
 	// If this situation occurs, the best we can do is trigger another
 	// scheduling cycle.
-	if len(s.slurmJobIR.JobInfo.Nodes) < len(s.slurmJobIR.Pods.Items) {
+	if feasibleSlurmNodes.Len() < len(s.slurmJobIR.Pods.Items) {
 		return nil, fwk.NewStatus(fwk.Success)
 	}
+	s.slurmJobIR.JobInfo.ExcNodes = slurmNodes.Difference(feasibleSlurmNodes).UnsortedList()
+	slices.Sort(s.slurmJobIR.JobInfo.ExcNodes)
 
 	// If no external job exists, we should create one with the list
 	// of nodes that passed Filter plugins.
 	if externalJob.JobId == 0 {
 		jobid, err := sb.slurmControl.SubmitJob(ctx, pod, s.slurmJobIR)
 		if err != nil {
-			aggErrors := func() utilerrors.Aggregate {
-				var target utilerrors.Aggregate
-				_ = errors.As(err, &target)
-				return target
-			}().Errors()
-			for _, e := range aggErrors {
-				if strings.ToLower(e.Error()) == ErrorNodeConfigInvalid.Error() {
-					logger.Error(err, "invalid node configuration for external job")
-					return nil, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, e.Error())
-				}
+			invalidConfigErr := findMatchingError(err, func(err error) bool {
+				return strings.EqualFold(err.Error(), ErrorNodeConfigInvalid.Error())
+			})
+			if invalidConfigErr != nil {
+				logger.Error(err, "invalid node configuration for external job")
+				return nil, fwk.NewStatus(fwk.UnschedulableAndUnresolvable, invalidConfigErr.Error())
 			}
 			logger.Error(err, "error submitting Slurm job")
 			return nil, fwk.NewStatus(fwk.Error, err.Error())
@@ -381,16 +505,46 @@ func (sb *SlurmBridge) PostFilter(ctx context.Context, state fwk.CycleState, pod
 		if err != nil {
 			return nil, fwk.NewStatus(fwk.Error, err.Error())
 		}
+		sb.activatePod(logger, pod)
 		return nil, fwk.NewStatus(fwk.Success)
 	}
 
 	logger.V(4).Info("external job exists")
 	if externalJob.Nodes == "" {
 		logger.V(4).Info("external job exists but no nodes have been allocated")
+		if !externalJob.Pending {
+			logger.V(4).Info("external job is no longer pending; waiting for allocated nodes")
+			sb.activatePod(logger, pod)
+			return nil, fwk.NewStatus(fwk.Success)
+		}
 		// As the external job is not yet running, update to the job
 		// to include any changes from slurmJobIR.
 		jobid, err := sb.slurmControl.UpdateJob(ctx, pod, s.slurmJobIR)
 		if err != nil {
+			if isJobNotPendingError(err) {
+				logger.V(4).Info("external job started before update completed")
+				externalJob, err := sb.slurmControl.GetJob(ctx, pod)
+				if err != nil {
+					logger.Error(err, "error checking for Slurm job after update race")
+					return nil, fwk.NewStatus(fwk.Error, err.Error())
+				}
+				if externalJob.JobId != 0 && externalJob.Nodes != "" {
+					slurmNodes, _ := hostlist.Expand(externalJob.Nodes)
+					kubeNodes, err := sb.slurmToKubeNodes(ctx, slurmNodes)
+					if err != nil {
+						return nil, fwk.NewStatus(fwk.Error, err.Error())
+					}
+					err = sb.annotatePodsWithNodes(ctx, externalJob.JobId, kubeNodes.Clone(), &s.slurmJobIR.Pods)
+					if err != nil {
+						return nil, fwk.NewStatus(fwk.Error, err.Error())
+					}
+					sb.activatePod(logger, pod)
+					return nil, fwk.NewStatus(fwk.Success)
+				}
+				logger.Error(ErrorJobNotPendingNoNodes, "external job update raced with Slurm but no nodes were allocated")
+				sb.activatePod(logger, pod)
+				return nil, fwk.NewStatus(fwk.Success)
+			}
 			logger.Error(err, "error updating Slurm job")
 			return nil, fwk.NewStatus(fwk.Error, err.Error())
 		}
@@ -401,17 +555,19 @@ func (sb *SlurmBridge) PostFilter(ctx context.Context, state fwk.CycleState, pod
 			logger.Error(err, "error labeling pods after update")
 			return nil, fwk.NewStatus(fwk.Error, err.Error())
 		}
+		sb.activatePod(logger, pod)
 		return nil, fwk.NewStatus(fwk.Success, ErrorNoNodesAssigned.Error())
 	}
 
 	// If we get here, that means the job started running after PreFilter occurred.
 	// Return a success so the pod will get another PreFilter attempt.
+	sb.activatePod(logger, pod)
 	return nil, fwk.NewStatus(fwk.Success, "")
 }
 
 // PreBindPreFlight will check if any GRES was requested for the external job
-func (sb *SlurmBridge) PreBindPreFlight(ctx context.Context, cs fwk.CycleState, pod *corev1.Pod, nodeName string) *fwk.Status {
-	return nil
+func (sb *SlurmBridge) PreBindPreFlight(ctx context.Context, cs fwk.CycleState, pod *corev1.Pod, nodeName string) (*fwk.PreBindPreFlightResult, *fwk.Status) {
+	return nil, nil
 }
 
 // PreBind will generate ResourceClaims for any GRES allocation in Slurm.
@@ -422,7 +578,11 @@ func (sb *SlurmBridge) PreBind(ctx context.Context, state fwk.CycleState, pod *c
 	// Note that whole node allocations in slurm will look like all
 	// resources were requested, but that doesn't mean the pod
 	// intended to use them.
-	resources, err := sb.slurmControl.GetResources(ctx, pod, nodeName)
+	node := &corev1.Node{}
+	if err := sb.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+		return fwk.NewStatus(fwk.Error, err.Error())
+	}
+	resources, err := sb.slurmControl.GetResources(ctx, pod, nodecontrollerutils.GetSlurmNodeName(node))
 	if err != nil {
 		return fwk.NewStatus(fwk.Error, err.Error())
 	}
@@ -532,7 +692,7 @@ func (sb *SlurmBridge) slurmToKubeNodes(ctx context.Context, slurmNodes []string
 func (sb *SlurmBridge) deleteExternalJob(ctx context.Context, pod *corev1.Pod) error {
 	logger := klog.FromContext(ctx)
 	// Construct an intermediate representation of the Slurm external job
-	slurmJobIR, err := slurmjobir.TranslateToSlurmJobIR(sb.Client, ctx, pod)
+	slurmJobIR, err := slurmjobir.TranslateToSlurmJobIR(sb.Client, sb.registry(), sb.workloadAPI, ctx, pod)
 	if err != nil {
 		logger.Error(err, "failed to translate to slurmjobir")
 		return err

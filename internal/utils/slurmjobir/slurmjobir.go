@@ -4,20 +4,25 @@
 package slurmjobir
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	resourcehelper "k8s.io/component-helpers/resource"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	"github.com/SlinkyProject/slurm-bridge/internal/utils"
+	"github.com/SlinkyProject/slurm-bridge/internal/dra"
+	"github.com/SlinkyProject/slurm-bridge/internal/utils/timelimit"
 	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 )
 
@@ -38,8 +43,9 @@ type SlurmJobIRJobInfo struct {
 	MemPerNode   *int64 // memory in megabytes
 	MinNodes     *int32
 	MaxNodes     *int32
-	Nodes        []string
+	ExcNodes     []string
 	Partition    *string
+	Priority     *int32
 	QOS          *string
 	Reservation  *string
 	TasksPerNode *int32
@@ -57,14 +63,59 @@ type SlurmJobIR struct {
 
 type translator struct {
 	client.Reader
-	ctx context.Context
+	ctx                 context.Context
+	draRegistry         *dra.Registry
+	deviceClassProfiles map[string]dra.DeviceProfile
+	workloadAPI         *WorkloadAPI
 }
 
-func PreFilter(c client.Client, ctx context.Context, pod *corev1.Pod, slurmJobIR *SlurmJobIR) *fwk.Status {
-	t := translator{Reader: c, ctx: ctx}
-	switch slurmJobIR.RootPOM.TypeMeta {
-	case podGroup_v1alpha1:
+func (t *translator) registry() *dra.Registry {
+	if t.draRegistry != nil {
+		return t.draRegistry
+	}
+	return dra.DefaultRegistry()
+}
+
+type workloadTranslator func(*translator, *corev1.Pod, *metav1.PartialObjectMetadata) (*SlurmJobIR, error)
+
+func workloadTranslatorFor(typeMeta metav1.TypeMeta) (workloadTranslator, bool) {
+	switch typeMeta {
+	case podGroupV1Alpha2, podGroupV1Beta1:
+		return (*translator).fromPodGroup, true
+	case jobSet_v1alpha2:
+		return (*translator).fromJobSet, true
+	case podgroup_coscheduling_v1alpha1:
+		return (*translator).fromPodGroupCoscheduling, true
+	case job_v1:
+		return (*translator).fromJob, true
+	case pod_v1:
+		return func(t *translator, pod *corev1.Pod, _ *metav1.PartialObjectMetadata) (*SlurmJobIR, error) {
+			return t.fromPod(pod)
+		}, true
+	case lws_v1:
+		return (*translator).fromLws, true
+	default:
+		return nil, false
+	}
+}
+
+func isSupportedWorkload(gvk schema.GroupVersionKind) bool {
+	typeMeta := metav1.TypeMeta{
+		APIVersion: gvk.GroupVersion().String(),
+		Kind:       gvk.Kind,
+	}
+	_, ok := workloadTranslatorFor(typeMeta)
+	return ok
+}
+
+func PreFilter(c client.Client, registry *dra.Registry, workloadAPI *WorkloadAPI, ctx context.Context, pod *corev1.Pod, slurmJobIR *SlurmJobIR) *fwk.Status {
+	t := translator{Reader: c, ctx: ctx, draRegistry: registry, workloadAPI: workloadAPI}
+	if isBuiltInPodGroup(slurmJobIR.RootPOM.TypeMeta) {
 		return t.PreFilterPodGroup(pod, slurmJobIR)
+	}
+	switch slurmJobIR.RootPOM.TypeMeta {
+	case podgroup_coscheduling_v1alpha1:
+		return t.PreFilterPodGroupCoscheduling(pod, slurmJobIR)
 	case lws_v1:
 		return t.PreFilterLWS(pod, slurmJobIR)
 	default:
@@ -72,18 +123,34 @@ func PreFilter(c client.Client, ctx context.Context, pod *corev1.Pod, slurmJobIR
 	}
 }
 
-func TranslateToSlurmJobIR(c client.Client, ctx context.Context, pod *corev1.Pod) (slurmJobIR *SlurmJobIR, err error) {
-	rootPOM, err := utils.GetRootOwnerMetadata(c, ctx, pod)
+func TranslateToSlurmJobIR(c client.Client, registry *dra.Registry, workloadAPI *WorkloadAPI, ctx context.Context, pod *corev1.Pod) (slurmJobIR *SlurmJobIR, err error) {
+	if err := ValidatePodGroupSupport(workloadAPI, pod); err != nil {
+		return nil, err
+	}
+	rootPOM, err := getRootOwnerMetadata(c, ctx, pod)
 	if err != nil {
 		return nil, err
 	}
 
-	t := translator{Reader: c, ctx: ctx}
+	t := translator{Reader: c, ctx: ctx, draRegistry: registry, workloadAPI: workloadAPI}
 
-	// PodGroup does not conventionally own the Pod, rather is associated by the PodGroupLabel.
-	// The Kubernetes co-scheduler would take the PodGroup into consideration when scheduling.
-	if _, podGroup := t.GetPodGroup(pod); podGroup != nil {
-		rootPOM.TypeMeta = podGroup_v1alpha1
+	// Only Gang PodGroups replace the normal workload root. Basic PodGroups
+	// still supply annotations, but leave allocation membership to the owner.
+	// Ref: https://kubernetes.io/docs/concepts/workloads/podgroup-api/
+	var pg *PodGroup
+	if pgName, ok := podGroupName(pod); ok {
+		pg = &PodGroup{TypeMeta: workloadAPI.PodGroupTypeMeta}
+		if err := t.Get(ctx, client.ObjectKey{Namespace: pod.Namespace, Name: pgName}, pg); err != nil {
+			return nil, err
+		}
+		if pg.Spec.SchedulingPolicy.Gang != nil {
+			rootPOM.TypeMeta = workloadAPI.PodGroupTypeMeta
+			rootPOM.Name = pgName
+		}
+	} else if _, podGroup := t.GetPodGroupCoscheduling(pod); podGroup != nil {
+		// PodGroup coscheduling does not conventionally own the Pod, rather is associated by the PodGroupLabel.
+		// The Kubernetes co-scheduler would take the PodGroup into consideration when scheduling.
+		rootPOM.TypeMeta = podgroup_coscheduling_v1alpha1
 		rootPOM.Name = podGroup.Name
 	}
 
@@ -91,18 +158,10 @@ func TranslateToSlurmJobIR(c client.Client, ctx context.Context, pod *corev1.Pod
 		return nil, err
 	}
 
-	switch rootPOM.TypeMeta {
-	case jobSet_v1alpha2:
-		slurmJobIR, err = t.fromJobSet(pod, rootPOM)
-	case podGroup_v1alpha1:
-		slurmJobIR, err = t.fromPodGroup(pod, rootPOM)
-	case job_v1:
-		slurmJobIR, err = t.fromJob(pod, rootPOM)
-	case pod_v1:
-		slurmJobIR, err = t.fromPod(pod)
-	case lws_v1:
-		slurmJobIR, err = t.fromLws(pod, rootPOM)
-	default:
+	translate, supported := workloadTranslatorFor(rootPOM.TypeMeta)
+	if supported {
+		slurmJobIR, err = translate(&t, pod, rootPOM)
+	} else {
 		slurmJobIR, err = t.fromPod(pod)
 	}
 	if err != nil {
@@ -110,8 +169,10 @@ func TranslateToSlurmJobIR(c client.Client, ctx context.Context, pod *corev1.Pod
 	}
 	slurmJobIR.RootPOM = *rootPOM
 	parsePodsCpuAndMemory(slurmJobIR)
-	parseGPUDevicePlugin(slurmJobIR)
-	err = parseAnnotations(slurmJobIR, rootPOM.Annotations)
+	if err := t.parseDeviceResources(slurmJobIR); err != nil {
+		return nil, err
+	}
+	err = t.applySlurmAnnotations(slurmJobIR, pod, rootPOM, pg)
 	return slurmJobIR, err
 }
 
@@ -146,31 +207,168 @@ func parsePodsCpuAndMemory(slurmJobIR *SlurmJobIR) {
 	}
 }
 
-/* Set GRES for the external job to the maximum quantity of GPUs requested */
-func parseGPUDevicePlugin(slurmJobIR *SlurmJobIR) {
-	var gres string
-	var gresMax resource.Quantity
-	for _, p := range slurmJobIR.Pods.Items {
-		lim := resourcehelper.PodLimits(&p, resourcehelper.PodResourcesOptions{})
-		for resourceName, quantity := range lim {
-			if resourceName == nvidiaDevicePlugin || resourceName == amdDevicePlugin {
-				if quantity.Cmp(gresMax) > 0 {
-					gresMax = quantity
-					gres = fmt.Sprintf("gres/gpu=%s", quantity.String())
-				}
-			}
-			if strings.HasPrefix(resourceName.String(), resourcev1.ResourceDeviceClassPrefix) {
-				if quantity.Cmp(gresMax) > 0 {
-					deviceClass := strings.TrimPrefix(string(resourceName), resourcev1.ResourceDeviceClassPrefix)
-					gres = fmt.Sprintf("gres/gpu:%s=%s", deviceClass, quantity.String())
-					gresMax = quantity
-				}
-			}
+// parseDeviceResources resolves DRA extended resources to DeviceProfiles and
+// dispatches their Slurm representation by backend. Core-bitmap quantities
+// contribute to CPUs per task; indexed-GRES quantities contribute to GRES.
+func (t *translator) parseDeviceResources(slurmJobIR *SlurmJobIR) error {
+	maxByGRES := make(map[dra.GRES]resource.Quantity)
+	for i := range slurmJobIR.Pods.Items {
+		podGRES, coreBitmapCPU, err := t.podDeviceResources(&slurmJobIR.Pods.Items[i])
+		if err != nil {
+			return err
+		}
+		mergeMaxGRESQuantities(maxByGRES, podGRES)
+		if coreBitmapCPU.Value() > 0 && (slurmJobIR.JobInfo.CpuPerTask == nil || coreBitmapCPU.Value() > int64(*slurmJobIR.JobInfo.CpuPerTask)) {
+			slurmJobIR.JobInfo.CpuPerTask = ptr.To(int32(coreBitmapCPU.Value())) //nolint:gosec
 		}
 	}
-	if gres != "" {
+
+	if gres := formatGRESResources(maxByGRES); gres != "" {
 		slurmJobIR.JobInfo.Gres = ptr.To(gres)
 	}
+	return nil
+}
+
+func (t *translator) podDeviceResources(pod *corev1.Pod) (map[dra.GRES]resource.Quantity, resource.Quantity, error) {
+	resources := make(map[dra.GRES]resource.Quantity)
+	limits := resourcehelper.PodLimits(pod, resourcehelper.PodResourcesOptions{})
+	requests := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{})
+	coreRequest, err := t.coreBitmapQuantity(requests)
+	if err != nil {
+		return nil, resource.Quantity{}, err
+	}
+	coreLimit, err := t.coreBitmapQuantity(limits)
+	if err != nil {
+		return nil, resource.Quantity{}, err
+	}
+	coreBitmapCPU := coreRequest
+	if coreLimit.Cmp(coreBitmapCPU) > 0 {
+		coreBitmapCPU = coreLimit
+	}
+	nativeCPU := *requests.Cpu()
+	if limits.Cpu().Cmp(nativeCPU) > 0 {
+		nativeCPU = *limits.Cpu()
+	}
+	if nativeCPU.Sign() > 0 && coreBitmapCPU.Sign() > 0 {
+		return nil, resource.Quantity{}, fmt.Errorf("pod %s requests both native CPU and a core-bitmap DeviceProfile", pod.Name)
+	}
+
+	for resourceName, quantity := range limits {
+		if quantity.Sign() <= 0 {
+			continue
+		}
+		name := resourceName.String()
+		// Explicit GPU extended resources remain device-plugin requests.
+		// Only deviceclass.resource.kubernetes.io/<class> selects DRA and
+		// dispatches through the resolved DeviceProfile backend.
+		if resourceName == nvidiaDevicePlugin || resourceName == amdDevicePlugin {
+			addGRESQuantity(resources, dra.GRES{Name: "gpu"}, quantity)
+			continue
+		}
+
+		className, ok := strings.CutPrefix(name, resourcev1.ResourceDeviceClassPrefix)
+		if !ok {
+			continue
+		}
+		profile, err := t.resolveDeviceClass(className)
+		if err != nil {
+			return nil, resource.Quantity{}, err
+		}
+		if profile.UsesCoreBitmap() {
+			continue
+		}
+		if !profile.UsesIndexedGRES() {
+			return nil, resource.Quantity{}, fmt.Errorf("DeviceClass %q resolves to unsupported backend %q", className, profile.Backend.String())
+		}
+		gres, err := profile.GRES()
+		if err != nil {
+			return nil, resource.Quantity{}, err
+		}
+		addGRESQuantity(resources, gres, quantity)
+	}
+	return resources, coreBitmapCPU, nil
+}
+
+func (t *translator) coreBitmapQuantity(resources corev1.ResourceList) (resource.Quantity, error) {
+	var total resource.Quantity
+	for resourceName, quantity := range resources {
+		if quantity.Sign() <= 0 {
+			continue
+		}
+		className, ok := strings.CutPrefix(resourceName.String(), resourcev1.ResourceDeviceClassPrefix)
+		if !ok {
+			continue
+		}
+		profile, err := t.resolveDeviceClass(className)
+		if err != nil {
+			return resource.Quantity{}, err
+		}
+		if profile.UsesCoreBitmap() {
+			total.Add(quantity)
+		}
+	}
+	return total, nil
+}
+
+func (t *translator) resolveDeviceClass(className string) (dra.DeviceProfile, error) {
+	if profile, ok := t.deviceClassProfiles[className]; ok {
+		return profile, nil
+	}
+	if t.deviceClassProfiles == nil {
+		t.deviceClassProfiles = make(map[string]dra.DeviceProfile)
+	}
+
+	deviceClass := &resourcev1.DeviceClass{}
+	if err := t.Get(t.ctx, client.ObjectKey{Name: className}, deviceClass); err != nil {
+		if apierrors.IsNotFound(err) {
+			return dra.DeviceProfile{}, fmt.Errorf("DeviceClass %q was not found", className)
+		}
+		return dra.DeviceProfile{}, fmt.Errorf("get DeviceClass %q: %w", className, err)
+	}
+
+	profile, err := t.registry().MatchDeviceClass(deviceClass)
+	if err != nil {
+		return dra.DeviceProfile{}, err
+	}
+	t.deviceClassProfiles[className] = profile
+	return profile, nil
+}
+
+func addGRESQuantity(resources map[dra.GRES]resource.Quantity, gres dra.GRES, quantity resource.Quantity) {
+	total := resources[gres]
+	total.Add(quantity)
+	resources[gres] = total
+}
+
+func mergeMaxGRESQuantities(maxByGRES, podGRES map[dra.GRES]resource.Quantity) {
+	for gres, quantity := range podGRES {
+		if current, ok := maxByGRES[gres]; !ok || quantity.Cmp(current) > 0 {
+			maxByGRES[gres] = quantity
+		}
+	}
+}
+
+func formatGRESResources(resources map[dra.GRES]resource.Quantity) string {
+	gresNames := make([]dra.GRES, 0, len(resources))
+	for gres := range resources {
+		gresNames = append(gresNames, gres)
+	}
+	slices.SortFunc(gresNames, func(a, b dra.GRES) int {
+		if n := cmp.Compare(a.Name, b.Name); n != 0 {
+			return n
+		}
+		return cmp.Compare(a.Type, b.Type)
+	})
+	entries := make([]string, len(gresNames))
+	for i, gres := range gresNames {
+		name := "gres/" + gres.Name
+		if gres.Type != "" {
+			name += ":" + gres.Type
+		}
+		quantity := resources[gres]
+		entries[i] = name + "=" + quantity.String()
+	}
+	return strings.Join(entries, ",")
 }
 
 func parseAnnotations(slurmJobIR *SlurmJobIR, anno map[string]string) error {
@@ -225,16 +423,22 @@ func parseAnnotations(slurmJobIR *SlurmJobIR, anno map[string]string) error {
 			slurmJobIR.JobInfo.MinNodes = num
 		case wellknown.AnnotationPartition:
 			slurmJobIR.JobInfo.Partition = &value
+		case wellknown.AnnotationPriority:
+			num, err := ConvStrTo32(value)
+			if err != nil {
+				return err
+			}
+			slurmJobIR.JobInfo.Priority = num
 		case wellknown.AnnotationQOS:
 			slurmJobIR.JobInfo.QOS = &value
 		case wellknown.AnnotationReservation:
 			slurmJobIR.JobInfo.Reservation = &value
 		case wellknown.AnnotationTimeLimit:
-			num, err := ConvStrTo32(value)
+			minutes, err := timelimit.Parse(value)
 			if err != nil {
 				return err
 			}
-			slurmJobIR.JobInfo.TimeLimit = num
+			slurmJobIR.JobInfo.TimeLimit = &minutes
 		case wellknown.AnnotationUserId:
 			slurmJobIR.JobInfo.UserId = &value
 		case wellknown.AnnotationWckey:

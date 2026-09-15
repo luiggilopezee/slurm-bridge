@@ -14,6 +14,10 @@ const (
 	// matching these partition names. The controller will error if any partition
 	// does not exist.
 	AnnotationExternalNodePartitions = SchedulerPrefix + "external-node-partitions"
+
+	// AnnotationNodeTopologySpec indicates the Slurm dynamic topology line
+	// (e.g. "topo-switch:s2,topo-block:b2") for an external node.
+	AnnotationNodeTopologySpec = TopologyPrefix + "spec"
 )
 
 const (
@@ -27,8 +31,8 @@ const (
 	// per task
 	AnnotationCpuPerTask = SlurmJobPrefix + "cpu-per-task"
 	// AnnotationExclusive overrides the default exclusive (SharedNone)
-	// flag for the Slurm external job. Set to "false" for non-exclusive
-	// placement; any other value or unset keeps exclusive.
+	// flag for the Slurm external job. With MCS isolation, "false" requests
+	// MCS-category sharing; any other value or unset keeps exclusive.
 	AnnotationExclusive = SlurmJobPrefix + "exclusive"
 	// AnnotationGres overrides the default gres
 	// for the Slurm external job.
@@ -54,14 +58,18 @@ const (
 	// AnnotationPartitions overrides the default partition
 	// for the Slurm external job.
 	AnnotationPartition = SlurmJobPrefix + "partition"
+	// AnnotationPriority sets the priority
+	// for the Slurm external job.
+	AnnotationPriority = SlurmJobPrefix + "priority"
 	// AnnotationQOS overrides the default QOS
 	// for the Slurm external job.
 	AnnotationQOS = SlurmJobPrefix + "qos"
 	// AnnotationReservation sets the reservation
 	// for the Slurm external job.
 	AnnotationReservation = SlurmJobPrefix + "reservation"
-	// AnnotationTimelimit sets the Time Limit in minutes
-	// for the Slurm external job.
+	// AnnotationTimeLimit sets the Time Limit for the Slurm external job.
+	// The value is a duration ("90s", "2h", "1d"), a Slurm --time value
+	// ("1-12:00:00") or a bare integer, which means minutes.
 	AnnotationTimeLimit = SlurmJobPrefix + "timelimit"
 	// AnnotationUserId overrides the default userid
 	// for the Slurm external job.

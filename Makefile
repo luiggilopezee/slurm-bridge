@@ -6,6 +6,11 @@
 # tools. (i.e. podman)
 CONTAINER_TOOL ?= docker
 
+# Use the Go version declared by the module for all Make targets.
+MODULE_GO_VERSION := $(strip $(shell sed -n -E 's/^go[[:space:]]+([^[:space:]]+).*$$/\1/p' go.mod))
+GOTOOLCHAIN := go$(MODULE_GO_VERSION)
+export GOTOOLCHAIN
+
 # Get the currently used golang install path (in GOPATH/bin, unless GOBIN is set)
 ifeq (,$(shell go env GOBIN))
 GOBIN=$(shell go env GOPATH)/bin
@@ -28,13 +33,21 @@ VERSION = $(shell cat ./VERSION)
 version: ## Show current version.
 	@echo VERSION=$(VERSION)
 
+.PHONY: go-version
+go-version: ## Show the Go toolchain version declared in go.mod.
+	@echo GOTOOLCHAIN=$(GOTOOLCHAIN)
+
 .PHONY: version-match
-version-match: version ## Check if versions are consistent.
+version-match: version ## Sync chart versions with VERSION.
 	@if [ -z "$$(echo $(VERSION) | grep -Eo "^[[:digit:]]+\.[[:digit:]]+\.[[:digit:]](-[[:alpha:]][[:alnum:]]*(\.[[:digit:]]+)?)?$$")" ]; then \
 		echo "VERSION is not semver: $(VERSION)" ;\
 		exit 1 ;\
 	fi
-	$(foreach chart, $(wildcard ./helm/**/Chart.yaml), $(SED) -i -E 's/version:[[:space:]]+.+$$/version: $(VERSION)/g' ${chart} ;)
+	$(foreach chart, $(wildcard ./helm/**/Chart.yaml), \
+		$(SED) -i -E \
+			-e 's/^appVersion:[[:space:]]+.*$$/appVersion: "$(VERSION)"/' \
+			-e 's/^version:[[:space:]]+.*$$/version: $(VERSION)/' \
+			${chart} ;)
 
 ##@ Build
 
@@ -54,8 +67,8 @@ build-images: ## Build container images.
 	REGISTRY=$(REGISTRY) VERSION=$(VERSION) $(CONTAINER_TOOL) buildx bake --builder=$(BUILDER)
 
 .PHONY: build-chart
-build-chart: ## Build charts.
-	$(foreach chart, $(wildcard ./helm/**/Chart.yaml), helm package --dependency-update helm/$(shell basename "$(shell dirname "${chart}")") ;)
+build-chart: helm-bin ## Build charts.
+	$(foreach chart, $(wildcard ./helm/**/Chart.yaml), $(HELM) package --dependency-update helm/$(shell basename "$(shell dirname "${chart}")") ;)
 
 .PHONY: push
 push: push-images push-charts ## Push OCI packages.
@@ -71,52 +84,54 @@ sign-images: push-images cosign-bin ## Sign pushed images with cosign keyless si
 
 .PHONY: push-charts
 push-charts: build-chart ## Push OCI packages.
-	$(foreach chart, $(wildcard ./*.tgz), helm push ${chart} oci://$(REGISTRY)/charts ;)
-
-##@ Demo
-
-# Use a fixed cluster name for the demo; do not run on an existing cluster we did not create.
-KIND_CLUSTER_NAME ?= slurm-bridge-demo
-
-.PHONY: demo-cluster-create
-demo-cluster-create: ## Spin up a kind cluster (slurm-bridge-demo) and install slurm-bridge using hack/kind.sh.
-	./hack/kind.sh --bridge $(KIND_CLUSTER_NAME)
-
-.PHONY: demo-cluster-delete
-demo-cluster-delete: ## Delete the kind cluster.
-	./hack/kind.sh --delete $(KIND_CLUSTER_NAME)
-
-.PHONY: install-dra
-install-dra: ## Add all DRA configs from hack/kind.sh (dra-driver-cpu and dra-example-driver).
-	./hack/kind.sh --dra-driver-cpu --dra-example-driver --bridge $(KIND_CLUSTER_NAME)
-
-.PHONY: setup-sysctl
-setup-sysctl: ## Set kernel/sysctl values recommended for kind/demo (requires sudo).
-	./hack/sysctl.sh
-
-# Exclude LWS (long-running) and DRA examples from main demo; DRA has its own demo-dra target.
-HACK_EXAMPLES ?= $(sort $(filter-out hack/examples/lws/lws.yaml $(wildcard hack/examples/dra/*.yaml),$(wildcard hack/examples/*/*.yaml)))
-HACK_EXAMPLES_DRA ?= $(sort $(wildcard hack/examples/dra/gpu-example/*.yaml))
-
-.PHONY: install-examples
-install-examples: ## run examples only-no cluster setup
-	for f in $(HACK_EXAMPLES); do $(KUBECTL) delete -f "$$f" || true; done; \
-    for f in $(HACK_EXAMPLES); do $(KUBECTL) apply -f "$$f"; done;
-
-.PHONY: demo-examples
-demo-examples: demo-cluster-create install-examples ## Run hack/examples YAMLs (except lws and dra) and watch (Ctrl+C to stop watch).
-	if [ "$$(uname -s)" != "Darwin" ]; then ./hack/demo_watch.sh || true; fi
-
-.PHONY: install-examples-dra
-install-examples-dra: ## install dra examples only-no cluster setup
-	for f in $(HACK_EXAMPLES_DRA); do $(KUBECTL) delete -f "$$f" || true; done; \
-	for f in $(HACK_EXAMPLES_DRA); do $(KUBECTL) apply -f "$$f"; done;
-
-.PHONY: demo-examples-dra
-demo-examples-dra: install-dra install-examples-dra ## Install DRA drivers and run DRA example pods and watch (Ctrl+C to stop).
-	if [ "$$(uname -s)" != "Darwin" ]; then ./hack/demo_watch.sh || true; fi
+	$(foreach chart, $(wildcard ./*.tgz), $(HELM) push ${chart} oci://$(REGISTRY)/charts ;)
 
 ##@ Deployment
+
+KIND_CLUSTER_NAME ?= slurm-bridge-dev
+SLURM_NODE_MODE ?= external
+
+.PHONY: kind-start
+kind-start: ## Create a Kind cluster and deploy the Slurm Bridge stack with DRA drivers.
+	./hack/kind.sh --all --slurm-node-mode="$(SLURM_NODE_MODE)" "$(KIND_CLUSTER_NAME)"
+
+.PHONY: kind-stop
+kind-stop: ## Delete the development Kind cluster.
+	./hack/kind.sh --delete $(KIND_CLUSTER_NAME)
+
+DEMO_WORKLOADS := \
+	hack/examples/pod/sleep.yaml \
+	hack/examples/job/single.yaml \
+	hack/examples/jobset/single.yaml \
+	hack/examples/podgroup-coscheduling/sleep.yaml \
+	hack/examples/dra/dranet/job.yaml \
+	hack/examples/dra/gpu-example/job.yaml
+
+.PHONY: demo-start
+demo-start: kind-start ## Create the demo stack and run example workloads.
+	./hack/kind.sh --extras $(KIND_CLUSTER_NAME)
+	@set -e; for file in $(DEMO_WORKLOADS); do \
+		$(KUBECTL) delete --ignore-not-found -f "$$file"; \
+		$(KUBECTL) apply -f "$$file"; \
+	done
+
+.PHONY: demo-stop
+demo-stop: ## Delete the demo workloads.
+	@set -e; for file in $(DEMO_WORKLOADS); do \
+		$(KUBECTL) delete --ignore-not-found -f "$$file"; \
+	done
+
+.PHONY: prereqs
+prereqs: ## Install prerequisites into the current Kubernetes context.
+	./hack/kind.sh --existing-cluster --prereqs
+
+.PHONY: deploy
+deploy: values-dev ## Build and deploy Slurm Bridge to the current Kubernetes context.
+	cd helm/slurm-bridge && skaffold run
+
+.PHONY: debug
+debug: values-dev ## Run Delve-enabled Slurm Bridge components and forward debug ports.
+	cd helm/slurm-bridge && skaffold debug --auto-build=true --auto-deploy=true --cleanup=false --port-forward=user --tail
 
 # Get the OS to set platform specific commands
 UNAME_S ?= $(shell uname -s)
@@ -127,41 +142,87 @@ else
 endif
 
 .PHONY: values-dev
-values-dev: ## Safely initialize values-dev.yaml files for Helm charts.
-	find "helm/" -type f -name "values.yaml" | $(SED) 'p;s/\.yaml/-dev\.yaml/' | \
-		xargs -n2 sh -c 'test -f "$$1" || cp -v "$$0" "$$1"'
+values-dev: ## Initialize sparse values-dev.yaml overrides for Helm charts.
+	find "helm/" -type f -name "values.yaml" | while read -r file; do \
+		dev="$${file%.yaml}-dev.yaml"; \
+		test -f "$$dev" || printf '{}\n' > "$$dev"; \
+	done
 
 ##@ Build Dependencies
 
 ## Location to install dependencies to
 LOCALBIN ?= $(shell pwd)/bin
+E2E_ARTIFACTS_DIR ?= $(shell pwd)/e2e-artifacts
+E2E_CLEANUP ?= true
+E2E_RUN ?=
+
 $(LOCALBIN):
 	mkdir -p $(LOCALBIN)
 
+# helm-install-plugin will 'helm plugin install' if missing or wrong version
+# $1 - plugin name
+# $2 - plugin urlgo
+# $3 - plugin version (optional)
+# verify_flag - added in the event that we are helm v4 or older due to https://helm.sh/docs/helm/helm_plugin_verify
+#   being updated to be more secure, but libraries currently do not support it.
+define helm-install-plugin
+@{ \
+set -e; \
+if [ ! -x "$(HELM)" ]; then \
+	echo "Helm binary not found at $(HELM). Run 'make helm-bin' first." ;\
+	exit 1 ;\
+fi ;\
+helm_major="$$( $(HELM) version --short 2>/dev/null | $(SED) -E 's/^v([0-9]+).*/\1/' )"; \
+if [ "$${helm_major}" = "4" ]; then \
+	verify_flag="--verify=false" ;\
+else \
+	verify_flag="" ;\
+fi ;\
+installed_version="$$( $(HELM) plugin list 2>/dev/null | awk '$$1=="$(1)" {print $$2}' )"; \
+if [ -z "$${installed_version}" ]; then \
+	if [ -n "$(3)" ]; then \
+		$(HELM) plugin install "$(2)" --version "$(3)" $${verify_flag} ;\
+	else \
+		$(HELM) plugin install "$(2)" $${verify_flag} ;\
+	fi ;\
+fi ;\
+}
+endef
+
 ## Tool Binaries
 KUBECTL ?= kubectl
-CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen-$(CONTROLLER_TOOLS_VERSION)
-ENVTEST ?= $(LOCALBIN)/setup-envtest-$(ENVTEST_VERSION)
-GOVULNCHECK ?= $(LOCALBIN)/govulncheck-$(GOVULNCHECK_VERSION)
+CONTROLLER_GEN ?= $(LOCALBIN)/controller-gen
+ENVTEST ?= $(LOCALBIN)/setup-envtest
+GOVULNCHECK ?= $(LOCALBIN)/govulncheck
+GOTESTSUM ?= $(LOCALBIN)/gotestsum
 GOLANGCI_LINT = $(LOCALBIN)/golangci-lint-$(GOLANGCI_LINT_VERSION)
-HELM_DOCS ?= $(LOCALBIN)/helm-docs-$(HELM_DOCS_VERSION)
+HELM_DOCS ?= $(LOCALBIN)/helm-docs
 PANDOC ?= $(LOCALBIN)/pandoc-$(PANDOC_VERSION)
-YQ ?= $(LOCALBIN)/yq-$(YQ_VERSION)
-COSIGN ?= $(LOCALBIN)/cosign-$(COSIGN_VERSION)
+YQ ?= $(LOCALBIN)/yq
+HELM ?= $(LOCALBIN)/helm-$(HELM_VERSION)
+COSIGN ?= $(LOCALBIN)/cosign
+HELM_CONFIG_HOME ?= $(LOCALBIN)/helm-config
+HELM_CACHE_HOME ?= $(LOCALBIN)/helm-cache
+HELM_DATA_HOME ?= $(LOCALBIN)/helm-data
+export HELM_CONFIG_HOME HELM_CACHE_HOME HELM_DATA_HOME
 
 ## Tool Versions
 CONTROLLER_TOOLS_VERSION ?= v0.20.1
 # ENVTEST_K8S_VERSION refers to the version of kubebuilder assets to be downloaded by envtest binary.
 ENVTEST_K8S_VERSION ?= $(shell go list -m -f "{{ .Version }}" k8s.io/api | awk -F'[v.]' '{printf "1.%d", $$3}')
 ENVTEST_VERSION ?= $(shell go list -m -f "{{ .Version }}" sigs.k8s.io/controller-runtime | awk -F'[v.]' '{printf "release-%d.%d", $$2, $$3}')
-GOVULNCHECK_VERSION ?= latest
+GOVULNCHECK_VERSION ?= v1.3.0
+GOTESTSUM_VERSION ?= v1.13.0
 # Written by `make govulncheck`: CSV (see file header comments). CI uploads as an artifact.
 GOVULNCHECK_REPORT ?= govulncheck-vulns.csv
 
 GOLANGCI_LINT_VERSION ?= v2.11.1
+GOLANGCI_LINT_BASE_REV ?= HEAD
 HELM_DOCS_VERSION ?= v1.14.2
 PANDOC_VERSION ?= 3.9
 YQ_VERSION ?= v4.45.1
+HELM_VERSION ?= v4.1.1
+HELM_UNITTEST_VERSION ?= v1.0.3
 COSIGN_VERSION ?= v2.4.1
 
 .PHONY: controller-gen
@@ -178,6 +239,11 @@ $(ENVTEST): $(LOCALBIN)
 govulncheck-bin: $(GOVULNCHECK) ## Download govulncheck locally if necessary.
 $(GOVULNCHECK): $(LOCALBIN)
 	$(call go-install-tool,$(GOVULNCHECK),golang.org/x/vuln/cmd/govulncheck,$(GOVULNCHECK_VERSION))
+
+.PHONY: gotestsum-bin
+gotestsum-bin: $(GOTESTSUM) ## Download gotestsum locally if necessary.
+$(GOTESTSUM): $(LOCALBIN)
+	$(call go-install-tool,$(GOTESTSUM),gotest.tools/gotestsum,$(GOTESTSUM_VERSION))
 
 .PHONY: golangci-lint-bin
 golangci-lint-bin: $(GOLANGCI_LINT) ## Download golangci-lint locally if necessary.
@@ -220,14 +286,28 @@ $(YQ): $(LOCALBIN)
 # $2 - package url which can be installed
 # $3 - specific version of package
 define go-install-tool
-@[ -f $(1) ] || { \
-set -e; \
-package=$(2)@$(3) ;\
-echo "Downloading $${package}" ;\
-GOBIN=$(LOCALBIN) go install $${package} ;\
-mv "$$(echo "$(1)" | $(SED) "s/-$(3)$$//")" $(1) ;\
-}
+@[ -f "$(1)-$(3)" ] || { \
+	set -e; \
+	package=$(2)@$(3) ;\
+	echo "Downloading $${package}" ;\
+	rm -f $(1) || true ;\
+	GOBIN=$(LOCALBIN) GOTOOLCHAIN=$(shell go env GOVERSION) go install $${package} ;\
+	mv $(1) $(1)-$(3) ;\
+} ;\
+ln -sf $(1)-$(3) $(1)
 endef
+
+.PHONY: helm-bin
+helm-bin: $(HELM) ## Download Helm locally if necessary.
+$(HELM): $(LOCALBIN)
+	@if ! [ -f "$(HELM)" ]; then \
+		tmpdir="$$(mktemp -d)" ;\
+		archive="helm-$(HELM_VERSION)-$$(go env GOOS)-$$(go env GOARCH).tar.gz" ;\
+		curl -sSLo "$${tmpdir}/$${archive}" "https://get.helm.sh/$${archive}" ;\
+		tar -xzf "$${tmpdir}/$${archive}" -C "$${tmpdir}" ;\
+		cp "$${tmpdir}/$$(go env GOOS)-$$(go env GOARCH)/helm" "$(HELM)" ;\
+		rm -rf "$${tmpdir}" ;\
+	fi
 
 ##@ Development
 
@@ -247,6 +327,19 @@ helm-docs: helm-docs-bin ## Run helm-docs.
 .PHONY: helm-lint
 helm-lint: ## Lint Helm charts.
 	find "helm/" -depth -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0r -n1 helm lint --strict
+
+.PHONY: helm-unittest
+helm-unittest: helm-unittest-bin ## Run helm-unittest.
+	find "helm/" -depth -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0r -n1 $(HELM) unittest --strict
+
+.PHONY: helm-unittest-update
+helm-unittest-update: helm-unittest-bin ## Update helm-unittest snapshots.
+	find "helm/" -depth -mindepth 1 -maxdepth 1 -type d -print0 | xargs -0r -n1 $(HELM) unittest --strict --update-snapshot
+
+.PHONY: helm-unittest-bin
+helm-unittest-bin: helm-bin ## Download helm-unittest plugin locally if necessary.
+	@mkdir -p "$(HELM_CONFIG_HOME)" "$(HELM_CACHE_HOME)" "$(HELM_DATA_HOME)/plugins"
+	$(call helm-install-plugin,unittest,https://github.com/helm-unittest/helm-unittest,$(HELM_UNITTEST_VERSION))
 
 .PHONY: helm-dependency-update
 helm-dependency-update: ## Update Helm chart dependencies.
@@ -304,6 +397,7 @@ fmt: ## Run go fmt against code.
 .PHONY: tidy
 tidy: ## Run go mod tidy against code
 	go mod tidy
+	$(MAKE) legal
 
 .PHONY: get-u
 get-u: ## Run `go get -u`
@@ -321,12 +415,84 @@ govulncheck: govulncheck-bin ## Write $(GOVULNCHECK_REPORT); fail if a vulnerabi
 # https://github.com/golangci/golangci-lint/blob/main/.pre-commit-hooks.yaml
 .PHONY: golangci-lint
 golangci-lint: golangci-lint-bin ## Run golangci-lint.
-	$(GOLANGCI_LINT) run --fix
+	$(GOLANGCI_LINT) run --new-from-rev "$(GOLANGCI_LINT_BASE_REV)" --fix
 
 # https://github.com/golangci/golangci-lint/blob/main/.pre-commit-hooks.yaml
 .PHONY: golangci-lint-fmt
 golangci-lint-fmt: golangci-lint-bin ## Run golangci-lint fmt.
 	$(GOLANGCI_LINT) fmt
+
+##@ Legal
+
+GO_MODULE ?= $(shell sed -n 's/^module[[:space:]]\{1,\}//p' go.mod)
+GO_LICENSES_VERSION ?= v2.0.1
+GO_LICENSES_PACKAGE ?= github.com/google/go-licenses/v2
+GO_LICENSES ?= $(LOCALBIN)/go-licenses
+LICENSE_PACKAGE_PATTERN ?= ./...
+LEGAL_GOOS ?= linux
+LEGAL_GOARCH ?= amd64
+LEGAL_FILES = THIRD_PARTY_LICENSES NOTICE
+
+.PHONY: go-licenses-bin
+go-licenses-bin: $(GO_LICENSES) ## Download go-licenses locally if necessary.
+$(GO_LICENSES): $(LOCALBIN)
+	$(call go-install-tool,$(GO_LICENSES),$(GO_LICENSES_PACKAGE),$(GO_LICENSES_VERSION))
+
+.PHONY: legal
+legal: $(LEGAL_FILES) ## Generate legal notice files.
+
+.PHONY: THIRD_PARTY_LICENSES
+THIRD_PARTY_LICENSES: $(GO_LICENSES)
+	@tmp=$$(mktemp); \
+	tpl=$$(mktemp); \
+	trap 'rm -f "$$tmp" "$$tpl"' EXIT; \
+	printf '{{ range . }}{{ .Name }}\t{{ .Version }}\t{{ .LicenseName }}\n{{ end }}' > "$$tpl"; \
+	{ \
+		printf '# Third-Party Software Licenses\n\n'; \
+		printf 'This file contains license information for third-party software components used in slurm-bridge.\n\n'; \
+		printf 'For complete license texts, please refer to the source repositories or the LICENSE files in the respective dependency packages.\n\n'; \
+		printf '## Dependencies\n\n'; \
+		first=true; \
+		GOOS=$(LEGAL_GOOS) GOARCH=$(LEGAL_GOARCH) $(GO_LICENSES) report "$(LICENSE_PACKAGE_PATTERN)" --template "$$tpl" --logtostderr=false --log_file=/dev/null --stderrthreshold=FATAL | LC_ALL=C sort -u | \
+			while IFS=$$(printf '\t') read -r name version license; do \
+				[ -n "$$name" ] || continue; \
+				case "$$name" in "$(GO_MODULE)"|"$(GO_MODULE)/"*) continue ;; esac; \
+				if [ "$$first" = true ]; then \
+					first=false; \
+				else \
+					printf '\n'; \
+				fi; \
+				printf '### %s\n' "$$name"; \
+				printf -- '- Name: %s\n' "$$name"; \
+				printf -- '- Version: %s\n' "$${version:-unknown}"; \
+				printf -- '- License: %s\n' "$${license:-UNKNOWN}"; \
+			done; \
+	} > "$$tmp"; \
+	mv "$$tmp" "$@"
+
+.PHONY: NOTICE
+NOTICE: $(GO_LICENSES)
+	@tmp=$$(mktemp); \
+	tpl=$$(mktemp); \
+	trap 'rm -f "$$tmp" "$$tpl"' EXIT; \
+	copyright=$$(sed -n '/^Copyright/{p;q;}' LICENSE 2>/dev/null); \
+	printf '{{ range . }}{{ .Name }}\t{{ .LicenseName }}\n{{ end }}' > "$$tpl"; \
+	{ \
+		printf '# slurm-bridge\n'; \
+		[ -z "$$copyright" ] || printf '%s\n' "$$copyright"; \
+		printf '\n'; \
+		printf 'This product includes the following third-party software components:\n\n'; \
+		printf 'For a complete list of third-party software licenses, please see the\n'; \
+		printf 'THIRD_PARTY_LICENSES file.\n\n'; \
+		printf 'Third-party Dependencies:\n'; \
+		GOOS=$(LEGAL_GOOS) GOARCH=$(LEGAL_GOARCH) $(GO_LICENSES) report "$(LICENSE_PACKAGE_PATTERN)" --template "$$tpl" --logtostderr=false --log_file=/dev/null --stderrthreshold=FATAL | LC_ALL=C sort -u | \
+			while IFS=$$(printf '\t') read -r name license; do \
+				[ -n "$$name" ] || continue; \
+				case "$$name" in "$(GO_MODULE)"|"$(GO_MODULE)/"*) continue ;; esac; \
+				printf -- '- %s (%s)\n' "$$name" "$${license:-UNKNOWN}"; \
+			done; \
+	} > "$$tmp"; \
+	mv "$$tmp" "$@"
 
 ## Location to locally build documentation
 LOCALBUILD ?= $(shell pwd)/build-docs
@@ -367,3 +533,12 @@ test: fmt vet envtest ## Run tests.
 			echo "Total test coverage ($${percentage}%) is less than the coverage threshold ($(CODECOV_PERCENT)%)."; \
 			exit 1; \
 		fi
+
+.PHONY: test-e2e
+test-e2e: $(GOTESTSUM) ## Run end-to-end tests against the current Kubernetes context.
+	mkdir -p "$(E2E_ARTIFACTS_DIR)"
+	E2E_ARTIFACTS_DIR="$(E2E_ARTIFACTS_DIR)" E2E_CLEANUP="$(E2E_CLEANUP)" SLURM_NODE_MODE="$(SLURM_NODE_MODE)" $(GOTESTSUM) \
+		--format testname \
+		--junitfile "$(E2E_ARTIFACTS_DIR)/junit.xml" \
+		--jsonfile "$(E2E_ARTIFACTS_DIR)/test-output.json" \
+		-- -count=1 -timeout 30m $(if $(strip $(E2E_RUN)),-run "$(E2E_RUN)",) ./test/e2e

@@ -10,6 +10,7 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/record"
@@ -18,6 +19,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/source"
@@ -25,7 +27,9 @@ import (
 	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
 
 	"github.com/SlinkyProject/slurm-bridge/internal/controller/node/slurmcontrol"
+	"github.com/SlinkyProject/slurm-bridge/internal/dra"
 	"github.com/SlinkyProject/slurm-bridge/internal/utils/durationstore"
+	"github.com/SlinkyProject/slurm-bridge/internal/utils/ratelimiter"
 )
 
 const (
@@ -59,12 +63,12 @@ type NodeReconciler struct {
 	EventCh       chan event.GenericEvent
 
 	slurmControl  slurmcontrol.SlurmControlInterface
-	eventRecorder record.EventRecorderLogger
+	draRegistry   *dra.Registry
+	eventRecorder record.EventRecorder
 }
 
-// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;patch;update;watch
+// +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;patch;watch
 // +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceslices,verbs=get;list;watch
-// +kubebuilder:rbac:groups=resource.k8s.io,resources=deviceclasses,verbs=get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
 // move the current state of the cluster closer to the desired state.
@@ -101,23 +105,31 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (res c
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *NodeReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if r.draRegistry == nil {
+		r.draRegistry = dra.DefaultRegistry()
+	}
+	if r.eventRecorder == nil {
+		r.eventRecorder = mgr.GetEventRecorderFor(ControllerName) //nolint:staticcheck // The controller currently records core/v1 Events.
+	}
 	nodeEventHandler := &nodeEventHandler{
 		Reader: mgr.GetCache(),
 	}
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("node-controller").
 		For(&corev1.Node{}).
+		Watches(&resourcev1.ResourceSlice{}, handler.EnqueueRequestsFromMapFunc(r.resourceSliceToNodes)).
 		WatchesRawSource(source.Channel(r.EventCh, nodeEventHandler)).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: maxConcurrentReconciles,
+			RateLimiter:             ratelimiter.Build[reconcile.Request](),
 		}).
 		Complete(r)
 }
-
-func NewReconciler(kubeClient client.Client, slurmClient slurmclient.Client, schedulerName string, eventCh chan event.GenericEvent) *NodeReconciler {
+func NewReconciler(kubeClient client.Client, slurmClient slurmclient.Client, schedulerName string, eventCh chan event.GenericEvent, draRegistry *dra.Registry) *NodeReconciler {
 	scheme := kubeClient.Scheme()
-	eventSource := corev1.EventSource{Component: ControllerName}
-	eventRecorder := record.NewBroadcaster().NewRecorder(scheme, eventSource)
+	if draRegistry == nil {
+		draRegistry = dra.DefaultRegistry()
+	}
 	r := &NodeReconciler{
 		Client:        kubeClient,
 		Scheme:        scheme,
@@ -125,7 +137,7 @@ func NewReconciler(kubeClient client.Client, slurmClient slurmclient.Client, sch
 		EventCh:       eventCh,
 		SlurmClient:   slurmClient,
 		slurmControl:  slurmcontrol.NewControl(slurmClient),
-		eventRecorder: eventRecorder,
+		draRegistry:   draRegistry,
 	}
 	return r
 }

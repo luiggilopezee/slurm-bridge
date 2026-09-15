@@ -3,21 +3,24 @@
 # SPDX-License-Identifier: Apache-2.0
 
 # https://skaffold.dev/docs/references/yaml/
-apiVersion: skaffold/v4beta1
+apiVersion: skaffold/v4beta14
 kind: Config
 build:
   artifacts:
     - image: slinky.slurm.net/slurm-bridge-scheduler
+      runtimeType: go
       context: ../../
       docker:
         dockerfile: Dockerfile
         target: scheduler
     - image: slinky.slurm.net/slurm-bridge-admission
+      runtimeType: go
       context: ../../
       docker:
         dockerfile: Dockerfile
         target: admission
     - image: slinky.slurm.net/slurm-bridge-controllers
+      runtimeType: go
       context: ../../
       docker:
         dockerfile: Dockerfile
@@ -26,9 +29,11 @@ build:
     inputDigest: {}
   local:
     useDockerCLI: true
-    push: false
 deploy:
   helm:
+    flags:
+      upgrade:
+        - --reset-values
     releases:
       - name: slurm-bridge
         chartPath: ./
@@ -41,5 +46,30 @@ deploy:
           admission.image.tag: '{{.IMAGE_TAG_slinky_slurm_net_slurm_bridge_admission}}'
           controllers.image.repository: '{{.IMAGE_REPO_slinky_slurm_net_slurm_bridge_controllers}}'
           controllers.image.tag: '{{.IMAGE_TAG_slinky_slurm_net_slurm_bridge_controllers}}'
-        namespace: slinky
+        namespace: slurm
         createNamespace: true
+profiles:
+  - name: kubernetes-1-35
+    activation:
+      - env: 'KUBERNETES_VERSION=^v1\.35\..*$'
+    patches:
+      - op: add
+        path: /deploy/helm/releases/0/setValues
+        value:
+          scheduler.featureGates.SlurmBridgeGenericWorkload: false
+portForward:
+  - resourceType: deployment
+    resourceName: slurm-bridge-scheduler
+    namespace: slurm
+    port: 56268
+    localPort: 40000
+  - resourceType: deployment
+    resourceName: slurm-bridge-controllers
+    namespace: slurm
+    port: 56268
+    localPort: 40001
+  - resourceType: deployment
+    resourceName: slurm-bridge-admission
+    namespace: slurm
+    port: 56268
+    localPort: 40002

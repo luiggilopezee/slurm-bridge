@@ -5,22 +5,21 @@ package pod
 
 import (
 	"context"
+	"errors"
 	"time"
-
-	"github.com/SlinkyProject/slurm-bridge/internal/utils/slurmjobir"
-	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/labels"
-	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/klog/v2"
 	podv1 "k8s.io/kubernetes/pkg/api/v1/pod"
-	"k8s.io/kubernetes/test/utils"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+
+	"github.com/SlinkyProject/slurm-bridge/internal/utils/slurmjobir"
+	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 )
 
 func (r *PodReconciler) Sync(ctx context.Context, req reconcile.Request) error {
@@ -38,7 +37,7 @@ func (r *PodReconciler) Sync(ctx context.Context, req reconcile.Request) error {
 		errs = append(errs, err)
 	}
 
-	return utilerrors.NewAggregate(errs)
+	return errors.Join(errs...)
 }
 
 // syncKubernetes reconciles the Kubernetes Pod with Slurm Jobs.
@@ -61,13 +60,18 @@ func (r *PodReconciler) syncKubernetes(ctx context.Context, req reconcile.Reques
 		return nil
 	}
 
-	// Requeue Pod request until terminal
-	if !podv1.IsPodTerminal(pod) {
-		durationStore.Push(podKey, 30*time.Second)
+	// Terminal pods are handled by prepareTerminalPod
+	if podv1.IsPodTerminal(pod) {
+		logger.V(2).Info("Pod is terminal, skipping", "pod", klog.KObj(pod))
+		return nil
 	}
 
-	if active, _ := utils.PodRunningReady(pod); !active {
-		logger.V(2).Info("Pod is not running, skipping", "pod", klog.KObj(pod))
+	// Requeue Pod request until terminal
+	durationStore.Push(podKey, 30*time.Second)
+
+	// Unbound pods must be scheduled before checking if the Slurm job is running
+	if pod.Spec.NodeName == "" {
+		logger.V(2).Info("Pod is not bound, skipping", "pod", klog.KObj(pod))
 		return nil
 	}
 
@@ -137,11 +141,20 @@ func (r *PodReconciler) syncSlurm(ctx context.Context, req reconcile.Request) er
 	}
 	jobId := slurmjobir.ParseSlurmJobId(pod.Labels[wellknown.LabelExternalJobId])
 	if nonTerminalPods == 0 {
-		logger.Info("Terminate Slurm Job for Pod", "pod", klog.KObj(pod), "jobId", jobId)
-		if err := r.slurmControl.TerminateJob(ctx, jobId); err != nil {
-			logger.Error(err, "failed to terminate Slurm Job without corresponding Pod",
-				"jobId", jobId, "pod", podKey)
+		jobIsPendingOrRunning, err := r.slurmControl.IsJobPendingOrRunning(ctx, jobId)
+		if err != nil {
 			return err
+		}
+
+		if jobIsPendingOrRunning {
+			logger.Info("Terminate Slurm Job for Pod", "pod", klog.KObj(pod), "jobId", jobId)
+			if err := r.slurmControl.TerminateJob(ctx, jobId); err != nil {
+				logger.Error(err, "failed to terminate Slurm Job without corresponding Pod",
+					"jobId", jobId, "pod", podKey)
+				return err
+			}
+		} else {
+			logger.V(4).Info("Skipping termination of Slurm Job for Pod", "jobId", jobId, "pod", podKey)
 		}
 	} else if terminatingPods > 0 {
 		logger.V(4).Info("Retaining Slurm Job until non-terminating Pods complete",

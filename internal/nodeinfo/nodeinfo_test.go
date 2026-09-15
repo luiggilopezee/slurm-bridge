@@ -5,743 +5,283 @@ package nodeinfo_test
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 
 	"github.com/SlinkyProject/slurm-bridge/internal/nodeinfo"
 	"github.com/SlinkyProject/slurm-bridge/internal/scheduler/plugins/slurmbridge/slurmcontrol"
 	"github.com/SlinkyProject/slurm-bridge/internal/utils/bitmaputil"
 )
 
-func init() {
-	utilruntime.Must(scheme.AddToScheme(scheme.Scheme))
-	utilruntime.Must(resourcev1.AddToScheme(scheme.Scheme))
+func cpuResourceSlice(nodeName string) *resourcev1.ResourceSlice {
+	device := func(name string, cpuID, coreID int64) resourcev1.Device {
+		return resourcev1.Device{
+			Name: name,
+			Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+				nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To(cpuID)},
+				nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To(coreID)},
+				nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
+				nodeinfo.DraDriverCpu_CoreType: {StringValue: ptr.To(nodeinfo.CoreTypeStandard.String())},
+			},
+		}
+	}
+	return &resourcev1.ResourceSlice{
+		ObjectMeta: metav1.ObjectMeta{Name: nodeName + "-cpus"},
+		Spec: resourcev1.ResourceSliceSpec{
+			NodeName: ptr.To(nodeName),
+			Pool: resourcev1.ResourcePool{
+				Name:               nodeName,
+				Generation:         1,
+				ResourceSliceCount: 1,
+			},
+			Driver: nodeinfo.DraDriverCpu,
+			Devices: []resourcev1.Device{
+				device("cpu0", 0, 0),
+				device("cpu1", 1, 0),
+				device("cpu2", 2, 1),
+				device("cpu3", 3, 1),
+			},
+		},
+	}
 }
 
-func resourceSliceNodeIndex(obj client.Object) []string {
-	rs, ok := obj.(*resourcev1.ResourceSlice)
-	if !ok {
-		return nil
-	}
-	nodeName := ptr.Deref(rs.Spec.NodeName, "")
-	if nodeName == "" {
-		return nil
-	}
-	return []string{nodeName}
+func cpuClient(objects ...client.Object) client.Client {
+	return fake.NewClientBuilder().WithObjects(objects...).Build()
 }
 
-func TestNodeInfo_GetDeviceRequests(t *testing.T) {
+func TestNodeInfoGetCPUDeviceRequests(t *testing.T) {
+	const deviceClassName = "my-cpus"
+	ctx := context.Background()
+	resources := &slurmcontrol.NodeResources{CoreBitmap: bitmaputil.String(bitmaputil.New(0))}
+	want := []resourcev1.DeviceRequest{{
+		Name: corev1.ResourceCPU.String(),
+		Exactly: &resourcev1.ExactDeviceRequest{
+			DeviceClassName: deviceClassName,
+			AllocationMode:  resourcev1.DeviceAllocationModeExactCount,
+			Count:           2,
+			Selectors: []resourcev1.DeviceSelector{{
+				CEL: &resourcev1.CELDeviceSelector{
+					Expression: "device.attributes['dra.cpu'].cpuID in [0,1]",
+				},
+			}},
+		},
+	}}
+
+	kubeClient := cpuClient(
+		&resourcev1.DeviceClass{ObjectMeta: metav1.ObjectMeta{Name: deviceClassName}},
+		cpuResourceSlice("node"),
+	)
+	node, err := nodeinfo.NewNodeInfo(ctx, kubeClient, "node")
+	if err != nil {
+		t.Fatalf("NewNodeInfo() error = %v", err)
+	}
+	got, err := node.GetCPUDeviceRequests(ctx, kubeClient, resources, deviceClassName)
+	if err != nil {
+		t.Fatalf("GetCPUDeviceRequests() error = %v", err)
+	}
+	if !equality.Semantic.DeepEqual(got, want) {
+		t.Fatalf("GetCPUDeviceRequests() = %#v, want %#v", got, want)
+	}
+}
+
+func TestNodeInfoGetCPUDeviceRequestsErrors(t *testing.T) {
+	ctx := context.Background()
+	resources := &slurmcontrol.NodeResources{CoreBitmap: bitmaputil.String(bitmaputil.New(0))}
 	tests := []struct {
 		name       string
-		kubeclient client.Client
-		nodeName   string
-		resources  *slurmcontrol.NodeResources
-		want       []resourcev1.DeviceRequest
-		wantErr    bool
+		kubeClient client.Client
+		want       string
 	}{
 		{
-			name: "dra.cpu",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{
-						ObjectMeta: metav1.ObjectMeta{Name: "node"},
-					},
-					&resourcev1.DeviceClass{
-						ObjectMeta: metav1.ObjectMeta{Name: nodeinfo.DraDriverCpu},
-					},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-slice"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraDriverCpu,
-							Devices: []resourcev1.Device{
-								{
-									Name: "cpu0",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreType: {IntValue: ptr.To(int64(nodeinfo.CoreTypeStandard))},
-									},
-								},
-								{
-									Name: "cpu1",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To[int64](1)},
-										nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreType: {IntValue: ptr.To(int64(nodeinfo.CoreTypeStandard))},
-									},
-								},
-								{
-									Name: "cpu2",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To[int64](2)},
-										nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To[int64](1)},
-										nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreType: {IntValue: ptr.To(int64(nodeinfo.CoreTypeStandard))},
-									},
-								},
-								{
-									Name: "cpu3",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To[int64](3)},
-										nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To[int64](1)},
-										nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreType: {IntValue: ptr.To(int64(nodeinfo.CoreTypeStandard))},
-									},
-								},
-							},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			resources: &slurmcontrol.NodeResources{
-				Node:       "node",
-				CoreBitmap: bitmaputil.String(bitmaputil.New(0)),
-			},
-			want: []resourcev1.DeviceRequest{
-				{
-					Name: "cpu",
-					Exactly: &resourcev1.ExactDeviceRequest{
-						DeviceClassName: nodeinfo.DraDriverCpu,
-						AllocationMode:  resourcev1.DeviceAllocationModeExactCount,
-						Count:           2,
-						Selectors: []resourcev1.DeviceSelector{
-							{
-								CEL: &resourcev1.CELDeviceSelector{
-									Expression: "device.attributes['dra.cpu'].cpuID in [0,1]",
-								},
-							},
-						},
-					},
-				},
-			},
+			name:       "missing DeviceClass",
+			kubeClient: cpuClient(cpuResourceSlice("node")),
+			want:       "was not found",
 		},
 		{
-			name: "gpu.example.com",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{
-						ObjectMeta: metav1.ObjectMeta{Name: "node"},
-					},
-					&resourcev1.DeviceClass{
-						ObjectMeta: metav1.ObjectMeta{Name: nodeinfo.DraExampleDriver},
-					},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-slice"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraExampleDriver,
-							Devices: []resourcev1.Device{
-								{
-									Name: "gpu-0",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](0)},
-									},
-								},
-								{
-									Name: "gpu-1",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](1)},
-									},
-								},
-								{
-									Name: "gpu-2",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](2)},
-									},
-								},
-								{
-									Name: "gpu-3",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](3)},
-									},
-								},
-							},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			resources: &slurmcontrol.NodeResources{
-				Node: "node",
-				Gres: []slurmcontrol.GresLayout{
-					{
-						Name:  "gpu",
-						Type:  nodeinfo.DraExampleDriver,
-						Count: 2,
-						Index: "0-1",
-					},
+			name: "DeviceClass lookup failure",
+			kubeClient: fake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
+				Get: func(context.Context, client.WithWatch, client.ObjectKey, client.Object, ...client.GetOption) error {
+					return errors.New("injected lookup failure")
 				},
-			},
-			want: []resourcev1.DeviceRequest{
-				{
-					Name: "gpu",
-					Exactly: &resourcev1.ExactDeviceRequest{
-						DeviceClassName: nodeinfo.DraExampleDriver,
-						AllocationMode:  resourcev1.DeviceAllocationModeExactCount,
-						Count:           2,
-						Selectors: []resourcev1.DeviceSelector{
-							{
-								CEL: &resourcev1.CELDeviceSelector{
-									Expression: "device.attributes['gpu.example.com'].index in [0,1]",
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		{
-			name: "gpu.nvidia.com",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{
-						ObjectMeta: metav1.ObjectMeta{Name: "node"},
-					},
-					&resourcev1.DeviceClass{
-						ObjectMeta: metav1.ObjectMeta{Name: nodeinfo.DraDriverGpuNvidia},
-					},
-					// NVIDIA k8s-dra-driver-gpu uses device Name "gpu-<minor>" (no "index" attribute).
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-slice"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraDriverGpuNvidia,
-							Devices: []resourcev1.Device{
-								{Name: "gpu-0"},
-								{Name: "gpu-1"},
-							},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			resources: &slurmcontrol.NodeResources{
-				Node: "node",
-				Gres: []slurmcontrol.GresLayout{
-					{
-						Name:  "gpu",
-						Type:  nodeinfo.DraDriverGpuNvidia,
-						Count: 2,
-						Index: "0-1",
-					},
-				},
-			},
-			want: []resourcev1.DeviceRequest{
-				{
-					Name: "gpu",
-					Exactly: &resourcev1.ExactDeviceRequest{
-						DeviceClassName: nodeinfo.DraDriverGpuNvidia,
-						AllocationMode:  resourcev1.DeviceAllocationModeExactCount,
-						Count:           2,
-						Selectors: []resourcev1.DeviceSelector{
-							{
-								CEL: &resourcev1.CELDeviceSelector{
-									Expression: "device.attributes['gpu.nvidia.com'].name in ['gpu-0','gpu-1']",
-								},
-							},
-						},
-					},
-				},
-			},
-		},
-		{
-			name: "unknown device class name is skipped",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{
-						ObjectMeta: metav1.ObjectMeta{Name: "node"},
-					},
-					&resourcev1.DeviceClass{
-						ObjectMeta: metav1.ObjectMeta{Name: "gpu.unknown.com"},
-					},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-slice-unknown"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   "gpu.unknown.com",
-							Devices:  []resourcev1.Device{{Name: "gpu-0"}},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			resources: &slurmcontrol.NodeResources{
-				Node: "node",
-				Gres: []slurmcontrol.GresLayout{
-					{
-						Name:  "gpu",
-						Type:  "gpu.unknown.com",
-						Count: 1,
-						Index: "0",
-					},
-				},
-			},
-			want: nil,
-		},
-		{
-			name: "unknown device class name is skipped when mixed with known",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{
-						ObjectMeta: metav1.ObjectMeta{Name: "node"},
-					},
-					&resourcev1.DeviceClass{
-						ObjectMeta: metav1.ObjectMeta{Name: nodeinfo.DraExampleDriver},
-					},
-					&resourcev1.DeviceClass{
-						ObjectMeta: metav1.ObjectMeta{Name: "gpu.unknown.com"},
-					},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-slice-example"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraExampleDriver,
-							Devices: []resourcev1.Device{
-								{
-									Name: "gpu-0",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](0)},
-									},
-								},
-								{
-									Name: "gpu-1",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](1)},
-									},
-								},
-							},
-						},
-					},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-slice-unknown"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   "gpu.unknown.com",
-							Devices:  []resourcev1.Device{{Name: "gpu-0"}},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			resources: &slurmcontrol.NodeResources{
-				Node: "node",
-				Gres: []slurmcontrol.GresLayout{
-					{
-						Name:  "gpu",
-						Type:  nodeinfo.DraExampleDriver,
-						Count: 1,
-						Index: "0",
-					},
-					{
-						Name:  "other",
-						Type:  "gpu.unknown.com",
-						Count: 1,
-						Index: "0",
-					},
-				},
-			},
-			want: []resourcev1.DeviceRequest{
-				{
-					Name: "gpu",
-					Exactly: &resourcev1.ExactDeviceRequest{
-						DeviceClassName: nodeinfo.DraExampleDriver,
-						AllocationMode:  resourcev1.DeviceAllocationModeExactCount,
-						Count:           1,
-						Selectors: []resourcev1.DeviceSelector{
-							{
-								CEL: &resourcev1.CELDeviceSelector{
-									Expression: "device.attributes['gpu.example.com'].index in [0]",
-								},
-							},
-						},
-					},
-				},
-			},
+			}).Build(),
+			want: "injected lookup failure",
 		},
 	}
+
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			n, err := nodeinfo.NewNodeInfo(context.Background(), tt.kubeclient, tt.nodeName)
+			node, err := nodeinfo.NewNodeInfo(ctx, tt.kubeClient, "node")
 			if err != nil {
-				t.Fatalf("could not construct receiver type: %v", err)
+				t.Fatalf("NewNodeInfo() error = %v", err)
 			}
-			got, gotErr := n.GetDeviceRequests(context.Background(), tt.kubeclient, tt.resources)
-			if gotErr != nil {
-				if !tt.wantErr {
-					t.Errorf("GetDeviceRequests() failed: %v", gotErr)
-				}
-				return
-			}
-			if tt.wantErr {
-				t.Fatal("GetDeviceRequests() succeeded unexpectedly")
-			}
-			if !equality.Semantic.DeepEqual(got, tt.want) {
-				t.Errorf("GetDeviceRequests() = %v, want %v", got, tt.want)
+			_, err = node.GetCPUDeviceRequests(ctx, tt.kubeClient, resources, nodeinfo.DraDriverCpu)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("GetCPUDeviceRequests() error = %v, want containing %q", err, tt.want)
 			}
 		})
 	}
 }
 
-func TestNodeInfo_GetDeviceRequestAllocationResult(t *testing.T) {
-	tests := []struct {
-		name       string
-		kubeclient client.Client
-		nodeName   string
-		resources  *slurmcontrol.NodeResources
-		want       []resourcev1.DeviceRequestAllocationResult
-		wantErr    bool
-	}{
-		{
-			name: "dra.cpu",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{
-						ObjectMeta: metav1.ObjectMeta{Name: "node"},
-					},
-					&resourcev1.DeviceClass{
-						ObjectMeta: metav1.ObjectMeta{Name: nodeinfo.DraDriverCpu},
-					},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-slice"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraDriverCpu,
-							Devices: []resourcev1.Device{
-								{
-									Name: "cpu0",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreType: {IntValue: ptr.To(int64(nodeinfo.CoreTypeStandard))},
-									},
-								},
-								{
-									Name: "cpu1",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To[int64](1)},
-										nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreType: {IntValue: ptr.To(int64(nodeinfo.CoreTypeStandard))},
-									},
-								},
-								{
-									Name: "cpu2",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To[int64](2)},
-										nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To[int64](1)},
-										nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreType: {IntValue: ptr.To(int64(nodeinfo.CoreTypeStandard))},
-									},
-								},
-								{
-									Name: "cpu3",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To[int64](3)},
-										nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To[int64](1)},
-										nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreType: {IntValue: ptr.To(int64(nodeinfo.CoreTypeStandard))},
-									},
-								},
-							},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			resources: &slurmcontrol.NodeResources{
-				Node:       "node",
-				CoreBitmap: bitmaputil.String(bitmaputil.New(0)),
-			},
-			want: []resourcev1.DeviceRequestAllocationResult{
-				{Request: "cpu", Driver: nodeinfo.DraDriverCpu, Device: "cpu0", Pool: "node"},
-				{Request: "cpu", Driver: nodeinfo.DraDriverCpu, Device: "cpu1", Pool: "node"},
-			},
-		},
-		{
-			name: "gpu.example.com",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{
-						ObjectMeta: metav1.ObjectMeta{Name: "node"},
-					},
-					&resourcev1.DeviceClass{
-						ObjectMeta: metav1.ObjectMeta{Name: nodeinfo.DraExampleDriver},
-					},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-slice"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraExampleDriver,
-							Devices: []resourcev1.Device{
-								{
-									Name: "gpu-0",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](0)},
-									},
-								},
-								{
-									Name: "gpu-1",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](1)},
-									},
-								},
-								{
-									Name: "gpu-2",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](2)},
-									},
-								},
-								{
-									Name: "gpu-3",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](3)},
-									},
-								},
-							},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			resources: &slurmcontrol.NodeResources{
-				Node: "node",
-				Gres: []slurmcontrol.GresLayout{
-					{
-						Name:  "gpu",
-						Type:  nodeinfo.DraExampleDriver,
-						Count: 2,
-						Index: "0-1",
-					},
-				},
-			},
-			want: []resourcev1.DeviceRequestAllocationResult{
-				{Request: "gpu", Driver: nodeinfo.DraExampleDriver, Device: "gpu-0", Pool: "node"},
-				{Request: "gpu", Driver: nodeinfo.DraExampleDriver, Device: "gpu-1", Pool: "node"},
-			},
-		},
-		{
-			name: "gpu.nvidia.com",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{
-						ObjectMeta: metav1.ObjectMeta{Name: "node"},
-					},
-					&resourcev1.DeviceClass{
-						ObjectMeta: metav1.ObjectMeta{Name: nodeinfo.DraDriverGpuNvidia},
-					},
-					// NVIDIA driver uses device Name "gpu-<minor>" (no "index" attribute).
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-slice"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraDriverGpuNvidia,
-							Devices: []resourcev1.Device{
-								{Name: "gpu-0"},
-								{Name: "gpu-1"},
-							},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			resources: &slurmcontrol.NodeResources{
-				Node: "node",
-				Gres: []slurmcontrol.GresLayout{
-					{
-						Name:  "gpu",
-						Type:  nodeinfo.DraDriverGpuNvidia,
-						Count: 2,
-						Index: "0-1",
-					},
-				},
-			},
-			want: []resourcev1.DeviceRequestAllocationResult{
-				{Request: "gpu", Driver: nodeinfo.DraDriverGpuNvidia, Device: "gpu-0", Pool: "node"},
-				{Request: "gpu", Driver: nodeinfo.DraDriverGpuNvidia, Device: "gpu-1", Pool: "node"},
-			},
-		},
+func TestNodeInfoGetCPUDeviceRequestAllocationResults(t *testing.T) {
+	ctx := context.Background()
+	kubeClient := cpuClient(
+		&resourcev1.DeviceClass{ObjectMeta: metav1.ObjectMeta{Name: nodeinfo.DraDriverCpu}},
+		cpuResourceSlice("node"),
+	)
+	node, err := nodeinfo.NewNodeInfo(ctx, kubeClient, "node")
+	if err != nil {
+		t.Fatalf("NewNodeInfo() error = %v", err)
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			n, err := nodeinfo.NewNodeInfo(context.Background(), tt.kubeclient, tt.nodeName)
-			if err != nil {
-				t.Fatalf("could not construct receiver type: %v", err)
-			}
-			got, gotErr := n.GetDeviceRequestAllocationResult(context.Background(), tt.kubeclient, tt.resources)
-			if gotErr != nil {
-				if !tt.wantErr {
-					t.Errorf("GetDeviceRequestAllocationResult() failed: %v", gotErr)
-				}
-				return
-			}
-			if tt.wantErr {
-				t.Fatal("GetDeviceRequestAllocationResult() succeeded unexpectedly")
-			}
-			if !equality.Semantic.DeepEqual(got, tt.want) {
-				t.Errorf("GetDeviceRequestAllocationResult() = %v, want %v", got, tt.want)
-			}
-		})
+	resources := &slurmcontrol.NodeResources{CoreBitmap: bitmaputil.String(bitmaputil.New(0))}
+	got, err := node.GetCPUDeviceRequestAllocationResults(ctx, kubeClient, resources, nodeinfo.DraDriverCpu)
+	if err != nil {
+		t.Fatalf("GetCPUDeviceRequestAllocationResults() error = %v", err)
+	}
+	want := []resourcev1.DeviceRequestAllocationResult{
+		{Request: "cpu", Driver: nodeinfo.DraDriverCpu, Pool: "node", Device: "cpu0"},
+		{Request: "cpu", Driver: nodeinfo.DraDriverCpu, Pool: "node", Device: "cpu1"},
+	}
+	if !equality.Semantic.DeepEqual(got, want) {
+		t.Fatalf("GetCPUDeviceRequestAllocationResults() = %#v, want %#v", got, want)
 	}
 }
 
-func TestNodeInfo_GetGresAndGresConf(t *testing.T) {
-	tests := []struct {
-		name       string
-		kubeclient client.Client
-		nodeName   string
-		wantGres   string
-		wantConf   string
-	}{
+func TestNodeInfoGetCPUDeviceRequestsIncludesAllAllocatedCoreThreads(t *testing.T) {
+	ctx := context.Background()
+	kubeClient := cpuClient(
+		&resourcev1.DeviceClass{ObjectMeta: metav1.ObjectMeta{Name: nodeinfo.DraDriverCpu}},
+		cpuResourceSlice("node"),
+	)
+	node, err := nodeinfo.NewNodeInfo(ctx, kubeClient, "node")
+	if err != nil {
+		t.Fatalf("NewNodeInfo() error = %v", err)
+	}
+	resources := &slurmcontrol.NodeResources{CoreBitmap: bitmaputil.String(bitmaputil.New(0, 1))}
+	requests, err := node.GetCPUDeviceRequests(ctx, kubeClient, resources, nodeinfo.DraDriverCpu)
+	if err != nil {
+		t.Fatalf("GetCPUDeviceRequests() error = %v", err)
+	}
+	if len(requests) != 1 || requests[0].Exactly == nil {
+		t.Fatalf("GetCPUDeviceRequests() = %#v, want one exact request", requests)
+	}
+	if got := requests[0].Exactly.Count; got != 4 {
+		t.Fatalf("GetCPUDeviceRequests() count = %d, want all 4 threads from two allocated cores", got)
+	}
+	wantSelector := "device.attributes['dra.cpu'].cpuID in [0,1,2,3]"
+	if got := requests[0].Exactly.Selectors[0].CEL.Expression; got != wantSelector {
+		t.Fatalf("GetCPUDeviceRequests() selector = %q, want %q", got, wantSelector)
+	}
+}
+
+func TestNewNodeInfoIgnoresGPUResourceSlices(t *testing.T) {
+	resourceSlices := []resourcev1.ResourceSlice{
+		*cpuResourceSlice("node"),
 		{
-			name: "no GRES when node has no GPU ResourceSlice",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}},
-				).
-				Build(),
-			nodeName: "node",
-			wantGres: "",
-			wantConf: "",
-		},
-		{
-			name: "no GRES when node has only CPU ResourceSlice",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-cpu"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraDriverCpu,
-							Devices: []resourcev1.Device{
-								{
-									Name: "cpu0",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraDriverCpu_CpuID:    {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreID:   {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
-										nodeinfo.DraDriverCpu_CoreType: {IntValue: ptr.To(int64(nodeinfo.CoreTypeStandard))},
-									},
-								},
-							},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			wantGres: "",
-			wantConf: "",
-		},
-		{
-			name: "example driver with single GPU",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-gpu"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraExampleDriver,
-							Devices: []resourcev1.Device{
-								{
-									Name: "gpu-0",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](0)},
-									},
-								},
-							},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			wantGres: "gpu:gpu.example.com:1",
-			wantConf: "count=1,name=gpu,type=gpu.example.com,file=gpu-0",
-		},
-		{
-			name: "example driver with four GPUs",
-			kubeclient: fake.NewClientBuilder().
-				WithIndex(&resourcev1.ResourceSlice{}, "spec.nodeName", resourceSliceNodeIndex).
-				WithObjects(
-					&corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: "node"}},
-					&resourcev1.ResourceSlice{
-						ObjectMeta: metav1.ObjectMeta{Name: "node-gpu"},
-						Spec: resourcev1.ResourceSliceSpec{
-							NodeName: ptr.To("node"),
-							Driver:   nodeinfo.DraExampleDriver,
-							Devices: []resourcev1.Device{
-								{
-									Name: "gpu-0",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](0)},
-									},
-								},
-								{
-									Name: "gpu-1",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](1)},
-									},
-								},
-								{
-									Name: "gpu-2",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](2)},
-									},
-								},
-								{
-									Name: "gpu-3",
-									Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
-										nodeinfo.DraExampleDriver_Index: {IntValue: ptr.To[int64](3)},
-									},
-								},
-							},
-						},
-					},
-				).
-				Build(),
-			nodeName: "node",
-			wantGres: "gpu:gpu.example.com:4",
-			wantConf: "count=4,name=gpu,type=gpu.example.com,file=gpu-0,file=gpu-1,file=gpu-2,file=gpu-3",
+			ObjectMeta: metav1.ObjectMeta{Name: "node-gpus"},
+			Spec: resourcev1.ResourceSliceSpec{
+				NodeName: ptr.To("node"),
+				Driver:   "gpu.nvidia.com",
+				Devices:  []resourcev1.Device{{Name: "gpu-0"}},
+			},
 		},
 	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			n, err := nodeinfo.NewNodeInfo(context.Background(), tt.kubeclient, tt.nodeName)
-			if err != nil {
-				t.Fatalf("NewNodeInfo() failed: %v", err)
-			}
-			gotGres, gotConf := n.GetGresAndGresConf()
-			if gotGres != tt.wantGres {
-				t.Errorf("GetGresAndGresConf() gres = %q, want %q", gotGres, tt.wantGres)
-			}
-			if gotConf != tt.wantConf {
-				t.Errorf("GetGresAndGresConf() gresConf = %q, want %q", gotConf, tt.wantConf)
-			}
-		})
+
+	node, err := nodeinfo.NewNodeInfoFromResourceSlices("node", resourceSlices)
+	if err != nil {
+		t.Fatalf("NewNodeInfoFromResourceSlices() error = %v", err)
+	}
+	if len(node.CpuMap.CPUInfoMap) != 4 {
+		t.Fatalf("NewNodeInfoFromResourceSlices() CPU count = %d, want 4", len(node.CpuMap.CPUInfoMap))
+	}
+}
+
+func TestNewNodeInfoFromResourceSlicesMergesLatestCompleteCPUPool(t *testing.T) {
+	old := cpuResourceSlice("node")
+	old.Name = "old"
+	old.Spec.Devices = old.Spec.Devices[:1]
+
+	currentA := cpuResourceSlice("node")
+	currentA.Name = "00000-current"
+	currentA.Spec.Pool.Generation = 2
+	currentA.Spec.Pool.ResourceSliceCount = 2
+	currentA.Spec.Devices = currentA.Spec.Devices[:2]
+
+	currentB := cpuResourceSlice("node")
+	currentB.Name = "00001-current"
+	currentB.Spec.Pool.Generation = 2
+	currentB.Spec.Pool.ResourceSliceCount = 2
+	currentB.Spec.Devices = currentB.Spec.Devices[2:]
+
+	node, err := nodeinfo.NewNodeInfoFromResourceSlices("node", []resourcev1.ResourceSlice{*currentB, *old, *currentA})
+	if err != nil {
+		t.Fatalf("NewNodeInfoFromResourceSlices() error = %v", err)
+	}
+	if got := len(node.CpuMap.CPUInfoMap); got != 4 {
+		t.Fatalf("NewNodeInfoFromResourceSlices() CPU count = %d, want 4", got)
+	}
+	if got := len(node.CpuMap.AbstractToMachine); got != 2 {
+		t.Fatalf("NewNodeInfoFromResourceSlices() core count = %d, want 2", got)
+	}
+	if node.CpuMap.Pool != "node" {
+		t.Fatalf("NewNodeInfoFromResourceSlices() pool = %q, want node", node.CpuMap.Pool)
+	}
+}
+
+func TestNewNodeInfoFromResourceSlicesRejectsIncompleteLatestCPUPool(t *testing.T) {
+	old := cpuResourceSlice("node")
+	old.Name = "old"
+
+	current := cpuResourceSlice("node")
+	current.Name = "00000-current"
+	current.Spec.Pool.Generation = 2
+	current.Spec.Pool.ResourceSliceCount = 2
+	current.Spec.Devices = current.Spec.Devices[:2]
+
+	_, err := nodeinfo.NewNodeInfoFromResourceSlices("node", []resourcev1.ResourceSlice{*old, *current})
+	if err == nil || !strings.Contains(err.Error(), "generation 2 is incomplete: found 1 of 2 ResourceSlices") {
+		t.Fatalf("NewNodeInfoFromResourceSlices() error = %v, want incomplete pool error", err)
+	}
+}
+
+func TestNewNodeInfoFromResourceSlicesRejectsGroupedCPUDevices(t *testing.T) {
+	resourceSlice := cpuResourceSlice("node")
+	resourceSlice.Spec.Devices = []resourcev1.Device{{
+		Name: "socket-0",
+		Attributes: map[resourcev1.QualifiedName]resourcev1.DeviceAttribute{
+			nodeinfo.DraDriverCpu_SocketID: {IntValue: ptr.To[int64](0)},
+			"dra.cpu/numCPUs":              {IntValue: ptr.To[int64](4)},
+		},
+	}}
+	_, err := nodeinfo.NewNodeInfoFromResourceSlices("node", []resourcev1.ResourceSlice{*resourceSlice})
+	if err == nil || !strings.Contains(err.Error(), "individual-device schema") {
+		t.Fatalf("NewNodeInfoFromResourceSlices() error = %v, want grouped-device rejection", err)
+	}
+}
+
+func TestNewNodeInfoFromResourceSlicesRejectsDuplicateCPUIds(t *testing.T) {
+	first := cpuResourceSlice("node")
+	first.Name = "node-cpus-0"
+	first.Spec.Pool.ResourceSliceCount = 2
+	first.Spec.Devices = first.Spec.Devices[:2]
+
+	second := cpuResourceSlice("node")
+	second.Name = "node-cpus-1"
+	second.Spec.Pool.ResourceSliceCount = 2
+	second.Spec.Devices = second.Spec.Devices[2:]
+	second.Spec.Devices[0].Attributes[nodeinfo.DraDriverCpu_CpuID] = resourcev1.DeviceAttribute{IntValue: ptr.To[int64](1)}
+
+	_, err := nodeinfo.NewNodeInfoFromResourceSlices("node", []resourcev1.ResourceSlice{*first, *second})
+	if err == nil || !strings.Contains(err.Error(), "duplicate CPU ID 1") {
+		t.Fatalf("NewNodeInfoFromResourceSlices() error = %v, want duplicate CPU ID error", err)
 	}
 }

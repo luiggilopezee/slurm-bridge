@@ -3,9 +3,10 @@
 
 ################################################################################
 
-FROM --platform=${BUILDPLATFORM} golang:1.26 AS builder
+FROM --platform=${BUILDPLATFORM} golang:1.26.6 AS builder
 ARG TARGETOS
 ARG TARGETARCH
+ARG SKAFFOLD_GO_GCFLAGS
 
 WORKDIR /workspace
 # Copy the Go Modules manifests
@@ -18,7 +19,7 @@ RUN go mod download
 COPY . .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o /workspace ./...
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -gcflags="${SKAFFOLD_GO_GCFLAGS}" -o /workspace ./...
 
 ################################################################################
 

@@ -6,12 +6,12 @@ package nodeinfo_test
 import (
 	"testing"
 
+	"github.com/kelindar/bitmap"
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/utils/cpuset"
 
 	"github.com/SlinkyProject/slurm-bridge/internal/nodeinfo"
 	"github.com/SlinkyProject/slurm-bridge/internal/utils/bitmaputil"
-	"github.com/kelindar/bitmap"
 )
 
 func TestNewCPUMap(t *testing.T) {
@@ -190,7 +190,7 @@ func TestNewCPUMap(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := nodeinfo.NewCPUMap(tt.cpuInfos)
+			got := nodeinfo.NewCPUMap("", tt.cpuInfos)
 			if !equality.Semantic.DeepEqual(got, tt.want) {
 				t.Errorf("NewCPUMap() = %v, want %v", got, tt.want)
 			}
@@ -231,7 +231,7 @@ func TestCPUMap_ToAbstractCPUs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cpumap := nodeinfo.NewCPUMap(tt.cpuInfos)
+			cpumap := nodeinfo.NewCPUMap("", tt.cpuInfos)
 			got := cpumap.ToAbstractCPUs(tt.macCpuSet)
 			if !equality.Semantic.DeepEqual(got, tt.want) {
 				t.Errorf("ToAbstractCPUs() = %v, want %v", got, tt.want)
@@ -273,7 +273,7 @@ func TestCPUMap_ToMachineCPUs(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cpumap := nodeinfo.NewCPUMap(tt.cpuInfos)
+			cpumap := nodeinfo.NewCPUMap("", tt.cpuInfos)
 			got := cpumap.ToMachineCPUs(tt.absBitmap)
 			if !equality.Semantic.DeepEqual(got, tt.want) {
 				t.Errorf("ToMachineCPUs() = %v, want %v", got, tt.want)

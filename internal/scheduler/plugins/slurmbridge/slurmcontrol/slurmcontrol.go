@@ -6,7 +6,9 @@ package slurmcontrol
 import (
 	"context"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/klog/v2"
@@ -23,8 +25,9 @@ import (
 )
 
 type ExternalJob struct {
-	JobId int32
-	Nodes string
+	JobId   int32
+	Nodes   string
+	Pending bool
 }
 
 type SlurmControlInterface interface {
@@ -32,9 +35,9 @@ type SlurmControlInterface interface {
 	DeleteJob(ctx context.Context, pod *corev1.Pod) error
 	GetJobsForPods(ctx context.Context) (*map[string]ExternalJob, error)
 	GetJob(ctx context.Context, pod *corev1.Pod) (*ExternalJob, error)
+	GetNodeNames(ctx context.Context, partition *string) ([]string, error)
 	SubmitJob(ctx context.Context, pod *corev1.Pod, slurmJobIR *slurmjobir.SlurmJobIR) (int32, error)
 	UpdateJob(ctx context.Context, pod *corev1.Pod, slurmJobIR *slurmjobir.SlurmJobIR) (int32, error)
-	IsSlurmNode(ctx context.Context, node string) (bool, error)
 }
 
 // RealPodControl is the default implementation of SlurmControlInterface.
@@ -46,6 +49,7 @@ type realSlurmControl struct {
 
 type NodeResources struct {
 	Node           string
+	NodeExtra      string
 	SocketsPerNode int32
 	CoresPerSocket int32
 	MemAlloc       int64
@@ -69,7 +73,7 @@ func sharedFromExclusiveAnnotation(slurmJobIR *slurmjobir.SlurmJobIR) *[]api.V00
 	if exclusive {
 		return &[]api.V0044JobDescMsgShared{api.V0044JobDescMsgSharedNone}
 	}
-	return &[]api.V0044JobDescMsgShared{}
+	return &[]api.V0044JobDescMsgShared{api.V0044JobDescMsgSharedMcs}
 }
 
 // DeleteSlurmJob will delete an external job
@@ -105,8 +109,9 @@ func (r *realSlurmControl) GetJobsForPods(ctx context.Context) (*map[string]Exte
 		if err := externaljobinfo.ParseIntoExternalJobInfo(j.AdminComment, &extInfo); err == nil {
 			for _, pod := range extInfo.Pods {
 				podToJob[pod] = ExternalJob{
-					JobId: *j.JobId,
-					Nodes: *j.Nodes,
+					JobId:   *j.JobId,
+					Nodes:   *j.Nodes,
+					Pending: j.GetStateAsSet().Has(api.V0044JobInfoJobStatePENDING),
 				}
 			}
 		}
@@ -141,6 +146,7 @@ func (r *realSlurmControl) GetJob(ctx context.Context, pod *corev1.Pod) (*Extern
 	logger.V(5).Info("found matching job")
 	jobOut.JobId = *job.JobId
 	jobOut.Nodes = *job.Nodes
+	jobOut.Pending = job.GetStateAsSet().Has(api.V0044JobInfoJobStatePENDING)
 	return &jobOut, nil
 }
 
@@ -163,6 +169,7 @@ func (r *realSlurmControl) submitJob(ctx context.Context, pod *corev1.Pod, slurm
 		extInfo.Pods = append(extInfo.Pods, p.Namespace+"/"+p.Name)
 	}
 	job := &slurmtypes.V0044JobInfo{}
+	excludedNodes := append(api.V0044CsvString{}, slurmJobIR.JobInfo.ExcNodes...)
 	jobSubmit := api.V0044JobSubmitReq{
 		Job: &api.V0044JobDescMsg{
 			Account:                 slurmJobIR.JobInfo.Account,
@@ -170,6 +177,12 @@ func (r *realSlurmControl) submitJob(ctx context.Context, pod *corev1.Pod, slurm
 			CpusPerTask:             slurmJobIR.JobInfo.CpuPerTask,
 			Constraints:             slurmJobIR.JobInfo.Constraints,
 			CurrentWorkingDirectory: ptr.To("/tmp"),
+			ExcludedNodes: func() *api.V0044CsvString {
+				if len(excludedNodes) == 0 && !update {
+					return nil
+				}
+				return &excludedNodes
+			}(),
 			Flags: &[]api.V0044JobDescMsgFlags{
 				api.V0044JobDescMsgFlagsEXTERNALJOB,
 			},
@@ -188,10 +201,20 @@ func (r *realSlurmControl) submitJob(ctx context.Context, pod *corev1.Pod, slurm
 					return &api.V0044Uint64NoValStruct{Set: ptr.To(false)}
 				}
 			}(),
-			MinimumNodes:  slurmJobIR.JobInfo.MinNodes,
-			Name:          slurmJobIR.JobInfo.JobName,
-			Nodes:         ptr.To(strconv.Itoa(len(slurmJobIR.Pods.Items))),
-			RequiredNodes: ptr.To(api.V0044CsvString(slurmJobIR.JobInfo.Nodes)),
+			MinimumNodes: slurmJobIR.JobInfo.MinNodes,
+			Name:         slurmJobIR.JobInfo.JobName,
+			Nodes:        ptr.To(strconv.Itoa(len(slurmJobIR.Pods.Items))),
+			Priority: func() *api.V0044Uint32NoValStruct {
+				if slurmJobIR.JobInfo.Priority != nil {
+					return &api.V0044Uint32NoValStruct{
+						Infinite: ptr.To(false),
+						Number:   slurmJobIR.JobInfo.Priority,
+						Set:      ptr.To(true),
+					}
+				} else {
+					return &api.V0044Uint32NoValStruct{Set: ptr.To(false)}
+				}
+			}(),
 			Partition: func() *string {
 				if slurmJobIR.JobInfo.Partition == nil {
 					return &r.partition
@@ -234,21 +257,26 @@ func (r *realSlurmControl) submitJob(ctx context.Context, pod *corev1.Pod, slurm
 	return ptr.Deref(job.JobId, 0), nil
 }
 
-func (r *realSlurmControl) IsSlurmNode(ctx context.Context, nodeName string) (bool, error) {
-	logger := klog.FromContext(ctx)
-
-	node := &slurmtypes.V0044Node{}
-	nodeKey := object.ObjectKey(nodeName)
-
-	err := r.Get(ctx, nodeKey, node)
-	if err != nil {
-		if err.Error() == http.StatusText(http.StatusNotFound) {
-			return false, nil
-		}
-		logger.Error(err, "could not get slurm node", "pod", nodeName)
-		return false, err
+func (r *realSlurmControl) GetNodeNames(ctx context.Context, partition *string) ([]string, error) {
+	list := &slurmtypes.V0044NodeList{}
+	if err := r.List(ctx, list); err != nil {
+		return nil, err
 	}
-	return true, nil
+	partitionNames := strings.Split(ptr.Deref(partition, r.partition), ",")
+	for i := range partitionNames {
+		partitionNames[i] = strings.TrimSpace(partitionNames[i])
+	}
+	nodeNames := make([]string, 0, len(list.Items))
+	for _, node := range list.Items {
+		partitions := ptr.Deref(node.Partitions, api.V0044CsvString{})
+		for _, partitionName := range partitionNames {
+			if slices.Contains(partitions, partitionName) {
+				nodeNames = append(nodeNames, ptr.Deref(node.Name, ""))
+				break
+			}
+		}
+	}
+	return nodeNames, nil
 }
 
 // GetResources will return the resources used by a node for a given JobId
@@ -270,8 +298,14 @@ func (r *realSlurmControl) GetResources(ctx context.Context, pod *corev1.Pod, no
 		if n.Node != nodeName {
 			continue
 		}
+		nodeExtra, err := r.getNodeExtra(ctx, nodeName)
+		if err != nil {
+			logger.Error(err, "could not get Slurm node Extra", "node", nodeName)
+			return nil, err
+		}
 		nodeOut := NodeResources{
 			Node:           n.Node,
+			NodeExtra:      nodeExtra,
 			SocketsPerNode: ptr.Deref(n.SocketsPerNode, 0),
 			CoresPerSocket: ptr.Deref(n.CoresPerSocket, 0),
 			MemAlloc:       ptr.Deref(n.MemAlloc, 0),
@@ -290,6 +324,14 @@ func (r *realSlurmControl) GetResources(ctx context.Context, pod *corev1.Pod, no
 		return &nodeOut, nil
 	}
 	return &NodeResources{}, nil
+}
+
+func (r *realSlurmControl) getNodeExtra(ctx context.Context, nodeName string) (string, error) {
+	node := &slurmtypes.V0044Node{}
+	if err := r.Get(ctx, object.ObjectKey(nodeName), node); err != nil {
+		return "", err
+	}
+	return ptr.Deref(node.Extra, ""), nil
 }
 
 var _ SlurmControlInterface = &realSlurmControl{}

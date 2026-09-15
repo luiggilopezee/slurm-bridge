@@ -68,12 +68,11 @@ apiVersion: slinky.slurm.net/v1beta1
 kind: Token
 metadata:
   name: slurm-bridge-token
-  namespace: slinky
+  namespace: slurm
 spec:
   jwtKeyRef:
     name: slurm-auth-jwt
     key: jwt.key
-    namespace: slurm
   secretRef:
     name: slurm-bridge-token
     key: auth-token
@@ -83,17 +82,12 @@ spec:
 EOF
 ```
 
-> [!NOTE]
-> A long lifetime is used as `slurm-bridge` does not automatically restart when
-> the secret is refreshed. This is a limitation that will be addressed in a
-> subsequent release.
-
 When running Slurm on baremetal:
 
 ```sh
 export $(scontrol token username=slurm lifespan=infinite)
 kubectl create namespace slurm-bridge
-kubectl create secret generic slurm-bridge-token --namespace=slinky --from-literal="auth-token=$SLURM_JWT" --type=Opaque
+kubectl create secret generic slurm-bridge-token --namespace=slurm --from-literal="auth-token=$SLURM_JWT" --type=Opaque
 ```
 
 ### 2. Download and configure `values.yaml` for the `slurm-bridge` helm chart
@@ -110,6 +104,10 @@ variables:
   `slurm-bridge` will associate jobs. This partition should only include nodes
   that have both [slurmd] and the [kubelet] running. The default value of this
   variable is `slurm-bridge`.
+- `schedulerConfig.mcsLabel` - sets the MCS category used whenever a workload
+  requests non-exclusive placement. A non-empty label and the additional Slurm
+  configuration are required, as described in
+  [Hybrid Workload Isolation](config.md#hybrid-workload-isolation).
 - `sharedConfig.slurmRestApi` - the URL used by `slurm-bridge` to interact with
   the Slurm REST API. Changing this value may be necessary if you run the REST
   API on a different URL or port. The default value of this variable is
@@ -119,7 +117,7 @@ variables:
 
 ```bash
 helm install slurm-bridge oci://ghcr.io/slinkyproject/charts/slurm-bridge \
-  --namespace=slinky --create-namespace
+  --namespace=slurm --create-namespace
 ```
 
 > [!NOTE]
@@ -130,7 +128,7 @@ helm install slurm-bridge oci://ghcr.io/slinkyproject/charts/slurm-bridge \
 You can check if your cluster deployed successfully with:
 
 ```sh
-kubectl --namespace=slinky get pods
+kubectl --namespace=slurm get pods
 ```
 
 Your output should be similar to:
@@ -159,7 +157,7 @@ it. There are
 [example workload](https://github.com/SlinkyProject/slurm-bridge/tree/main/hack/examples)
 definitions in the `slurm-bridge` repo.
 
-Here's an example of a simple job, found in `hack/examples/single.yaml`:
+Here's an example of a simple job, found in `hack/examples/job/single.yaml`:
 
 ```yaml
 ---
@@ -170,18 +168,17 @@ metadata:
   namespace: slurm-bridge
   # slurm-bridge annotations on parent object
   annotations:
-    slinky.slurm.net/job-name: job-sleep-single
-    slinky.slurm.net/timelimit: "5"
-    slinky.slurm.net/account: foo
+    slurmjob.slinky.slurm.net/job-name: job-sleep-single
 spec:
   completions: 1
   parallelism: 1
   template:
     spec:
+      schedulerName: slurm-bridge-scheduler
       containers:
         - name: sleep
           image: busybox:stable
-          command: [sh, -c, sleep 30]
+          command: [sh, -c, sleep 3]
           resources:
             requests:
               cpu: '1'
@@ -191,6 +188,20 @@ spec:
               memory: 100Mi
       restartPolicy: Never
 ```
+
+`schedulerName: slurm-bridge-scheduler` is what routes the pod to
+`slurm-bridge`. In a namespace listed in the chart's
+`admission.managedNamespaces`, which defaults to just `slurm-bridge`, the
+admission controller rewrites `schedulerName` for you, so the field is optional
+there. The example sets it explicitly so the manifest also works when submitted
+to a namespace the admission controller does not manage.
+
+Every slurm-bridge annotation is prefixed with `slurmjob.slinky.slurm.net/` and
+must be set on the parent object. An annotation with any other prefix is
+silently ignored, so a typo in the prefix costs you the setting with no error to
+explain it. Any other Slurm job parameter is passed the same way, including the
+time limit, account, partition, QoS and GRES. See
+[Annotations](scheduler.md#annotations) for the supported keys.
 
 Let's run this job:
 
@@ -225,7 +236,7 @@ Labels:           batch.kubernetes.io/controller-uid=7cf47949-0099-4c1a-ab7e-d6e
                   batch.kubernetes.io/job-name=job-sleep-single
                   controller-uid=7cf47949-0099-4c1a-ab7e-d6e288283c82
                   job-name=job-sleep-single
-Annotations:      slinky.slurm.net/job-name: job-sleep-single
+Annotations:      slurmjob.slinky.slurm.net/job-name: job-sleep-single
 Parallelism:      1
 Completions:      1
 Completion Mode:  NonIndexed
@@ -326,7 +337,7 @@ Labels:           batch.kubernetes.io/controller-uid=8a03f5f6-f0c0-4216-ac0b-8c9
                   batch.kubernetes.io/job-name=job-sleep-single
                   controller-uid=8a03f5f6-f0c0-4216-ac0b-8c9b70c92eec
                   job-name=job-sleep-single
-Annotations:      slinky.slurm.net/job-name: job-sleep-single
+Annotations:      slurmjob.slinky.slurm.net/job-name: job-sleep-single
 Parallelism:      1
 Completions:      1
 Completion Mode:  NonIndexed

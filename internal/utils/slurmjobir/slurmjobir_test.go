@@ -5,18 +5,31 @@ package slurmjobir
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
-	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	resourcev1 "k8s.io/api/resource/v1"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	st "k8s.io/kubernetes/pkg/scheduler/testing"
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
+	jobset "sigs.k8s.io/jobset/api/jobset/v1alpha2"
+
+	"github.com/SlinkyProject/slurm-bridge/internal/dra"
+	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 )
 
 func podWithResources(cpuRequest, memoryRequest, cpuLimit, memoryLimit string) corev1.Pod {
@@ -161,7 +174,7 @@ func TestTranslateToSlurmJobIR(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got, err := TranslateToSlurmJobIR(tt.args.client, tt.args.ctx, tt.args.pod)
+			got, err := TranslateToSlurmJobIR(tt.args.client, dra.DefaultRegistry(), nil, tt.args.ctx, tt.args.pod)
 			if (err != nil) != tt.wantErr {
 				t.Errorf("TranslateToSlurmJobIR() error = %v, wantErr %v", err, tt.wantErr)
 				return
@@ -170,6 +183,137 @@ func TestTranslateToSlurmJobIR(t *testing.T) {
 				t.Errorf("TranslateToSlurmJobIR() = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTranslateToSlurmJobIRFallsBackFromForbiddenUnsupportedController(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	unsupportedGVK := schema.FromAPIVersionAndKind("example.com/v1", "ExampleController")
+	const unsupportedName = "example-controller"
+
+	job := &batchv1.Job{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: batchv1.SchemeGroupVersion.String(),
+			Kind:       "Job",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "job1",
+			Annotations: map[string]string{
+				wellknown.AnnotationAccount: "job-account",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				{
+					APIVersion: unsupportedGVK.GroupVersion().String(),
+					Kind:       unsupportedGVK.Kind,
+					Name:       unsupportedName,
+					Controller: ptr.To(true),
+				},
+			},
+		},
+	}
+	pod := st.MakePod().Namespace("default").Name("pod1").Obj()
+	pod.OwnerReferences = []metav1.OwnerReference{
+		{
+			APIVersion: batchv1.SchemeGroupVersion.String(),
+			Kind:       "Job",
+			Name:       job.Name,
+			Controller: ptr.To(true),
+		},
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(job, pod).
+		WithInterceptorFuncs(interceptor.Funcs{
+			Get: func(ctx context.Context, c client.WithWatch, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+				if key.Name == unsupportedName {
+					return apierrors.NewForbidden(
+						unsupportedGVK.GroupVersion().WithResource("examplecontrollers").GroupResource(),
+						unsupportedName,
+						errors.New("access denied"),
+					)
+				}
+				return c.Get(ctx, key, obj, opts...)
+			},
+		}).
+		Build()
+
+	got, err := TranslateToSlurmJobIR(cl, dra.DefaultRegistry(), nil, context.TODO(), pod)
+	if err != nil {
+		t.Fatalf("TranslateToSlurmJobIR() error = %v", err)
+	}
+	if got.RootPOM.TypeMeta != job_v1 || got.RootPOM.Name != job.Name {
+		t.Errorf("RootPOM = %v %q, want %v %q", got.RootPOM.TypeMeta, got.RootPOM.Name, job_v1, job.Name)
+	}
+	if got.JobInfo.MinNodes == nil || *got.JobInfo.MinNodes != 1 {
+		t.Errorf("MinNodes = %v, want 1 from the Job controller", got.JobInfo.MinNodes)
+	}
+	if got.JobInfo.Account == nil || *got.JobInfo.Account != "job-account" {
+		t.Errorf("Account = %v, want Job controller annotation", got.JobInfo.Account)
+	}
+}
+
+func TestTranslateToSlurmJobIRPrefersSupportedWorkloadBelowReadableAncestor(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(jobset.AddToScheme(scheme))
+
+	deployment := &appsv1.Deployment{
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: appsv1.SchemeGroupVersion.String(),
+			Kind:       "Deployment",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "outer-controller",
+		},
+	}
+	jobSet := &jobset.JobSet{
+		TypeMeta: jobSet_v1alpha2,
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "jobset1",
+			Annotations: map[string]string{
+				wellknown.AnnotationAccount: "jobset-account",
+			},
+			OwnerReferences: []metav1.OwnerReference{
+				controllerOwner(deployment.APIVersion, deployment.Kind, deployment.Name),
+			},
+		},
+	}
+	job := &batchv1.Job{
+		TypeMeta: job_v1,
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: "default",
+			Name:      "job1",
+			OwnerReferences: []metav1.OwnerReference{
+				controllerOwner(jobSet.APIVersion, jobSet.Kind, jobSet.Name),
+			},
+		},
+	}
+	pod := st.MakePod().
+		Namespace("default").
+		Name("pod1").
+		Label("job-name", job.Name).
+		Obj()
+	pod.OwnerReferences = []metav1.OwnerReference{
+		controllerOwner(job.APIVersion, job.Kind, job.Name),
+	}
+	cl := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithObjects(deployment, jobSet, job, pod).
+		Build()
+
+	got, err := TranslateToSlurmJobIR(cl, dra.DefaultRegistry(), nil, context.TODO(), pod)
+	if err != nil {
+		t.Fatalf("TranslateToSlurmJobIR() error = %v", err)
+	}
+	if got.RootPOM.TypeMeta != jobSet_v1alpha2 || got.RootPOM.Name != jobSet.Name {
+		t.Errorf("RootPOM = %v %q, want %v %q", got.RootPOM.TypeMeta, got.RootPOM.Name, jobSet_v1alpha2, jobSet.Name)
+	}
+	if got.JobInfo.Account == nil || *got.JobInfo.Account != "jobset-account" {
+		t.Errorf("Account = %v, want JobSet controller annotation", got.JobInfo.Account)
 	}
 }
 
@@ -263,7 +407,7 @@ func Test_parsePodsCpuAndMemory(t *testing.T) {
 	}
 }
 
-func Test_parseGPUDevicePlugin(t *testing.T) {
+func TestTranslatorParseDeviceResources(t *testing.T) {
 	type args struct {
 		slurmJobIR *SlurmJobIR
 	}
@@ -278,6 +422,19 @@ func Test_parseGPUDevicePlugin(t *testing.T) {
 				slurmJobIR: &SlurmJobIR{
 					Pods: corev1.PodList{
 						Items: []corev1.Pod{},
+					},
+				},
+			},
+			want: nil,
+		},
+		{
+			name: "Zero GPUs requested",
+			args: args{
+				slurmJobIR: &SlurmJobIR{
+					Pods: corev1.PodList{
+						Items: []corev1.Pod{
+							podWithGPU("nvidia.com/gpu", "0"),
+						},
 					},
 				},
 			},
@@ -334,7 +491,20 @@ func Test_parseGPUDevicePlugin(t *testing.T) {
 					},
 				},
 			},
-			want: ptr.To("gres/gpu:gpu.nvidia.com=1"),
+			want: ptr.To("gres/gpu:gpu-nvidia=1"),
+		},
+		{
+			name: "CPU DRA Extended Resource Claim is ignored for GRES",
+			args: args{
+				slurmJobIR: &SlurmJobIR{
+					Pods: corev1.PodList{
+						Items: []corev1.Pod{
+							podWithGPU(resourcev1.ResourceDeviceClassPrefix+"dra.cpu", "1"),
+						},
+					},
+				},
+			},
+			want: nil,
 		},
 		{
 			name: "Multiple GPU DRA Extended Resource Claims",
@@ -348,12 +518,31 @@ func Test_parseGPUDevicePlugin(t *testing.T) {
 					},
 				},
 			},
-			want: ptr.To("gres/gpu:gpu.nvidia.com=2"),
+			want: ptr.To("gres/gpu:gpu-nvidia=2"),
 		},
+	}
+	cpuClass := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "dra.cpu"},
+		Spec: resourcev1.DeviceClassSpec{Selectors: []resourcev1.DeviceSelector{{
+			CEL: &resourcev1.CELDeviceSelector{Expression: `device.driver == "dra.cpu"`},
+		}}},
+	}
+	nvidiaClass := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu.nvidia.com"},
+		Spec: resourcev1.DeviceClassSpec{Selectors: []resourcev1.DeviceSelector{{
+			CEL: &resourcev1.CELDeviceSelector{Expression: `device.driver == 'gpu.nvidia.com' && device.attributes['gpu.nvidia.com'].type == 'gpu'`},
+		}}},
+	}
+	translator := translator{
+		Reader:      fake.NewClientBuilder().WithObjects(cpuClass, nvidiaClass).Build(),
+		ctx:         context.Background(),
+		draRegistry: dra.DefaultRegistry(),
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			parseGPUDevicePlugin(tt.args.slurmJobIR)
+			if err := translator.parseDeviceResources(tt.args.slurmJobIR); err != nil {
+				t.Fatalf("translator.parseDeviceResources() error = %v", err)
+			}
 			if !apiequality.Semantic.DeepEqual(tt.want, tt.args.slurmJobIR.JobInfo.Gres) {
 				var gotGres, wantGres interface{}
 				if tt.args.slurmJobIR.JobInfo.Gres != nil {
@@ -366,9 +555,202 @@ func Test_parseGPUDevicePlugin(t *testing.T) {
 				} else {
 					wantGres = nil
 				}
-				t.Errorf("parseGPUDevicePlugin() Gres = %v, want %v", gotGres, wantGres)
+				t.Errorf("translator.parseDeviceResources() Gres = %v, want %v", gotGres, wantGres)
 			}
 		})
+	}
+}
+
+func TestTranslatorParseDeviceResourcesUsesConfiguredDeviceProfile(t *testing.T) {
+	const className = "example-gpus"
+	deviceClass := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{Name: className},
+		Spec: resourcev1.DeviceClassSpec{
+			Selectors: []resourcev1.DeviceSelector{{
+				CEL: &resourcev1.CELDeviceSelector{Expression: `device.driver == 'accelerator.example.com'`},
+			}},
+		},
+	}
+	registry, err := dra.NewRegistry([]dra.DeviceProfile{{
+		Name:     "custom-accelerator",
+		Driver:   "accelerator.example.com",
+		Selector: `device.driver == 'accelerator.example.com'`,
+		Backend:  dra.IndexedGRESBackend{GRESName: "accelerator"},
+	}})
+	if err != nil {
+		t.Fatalf("dra.NewRegistry() error = %v", err)
+	}
+	ir := &SlurmJobIR{Pods: corev1.PodList{Items: []corev1.Pod{
+		podWithGPU(resourcev1.ResourceDeviceClassPrefix+className, "2"),
+	}}}
+	translator := translator{
+		Reader:      fake.NewClientBuilder().WithObjects(deviceClass).Build(),
+		ctx:         context.Background(),
+		draRegistry: registry,
+	}
+
+	if err = translator.parseDeviceResources(ir); err != nil {
+		t.Fatalf("translator.parseDeviceResources() error = %v", err)
+	}
+	if ir.JobInfo.Gres == nil || *ir.JobInfo.Gres != "gres/accelerator:custom-accelerator=2" {
+		t.Fatalf("translator.parseDeviceResources() Gres = %v, want %q", ir.JobInfo.Gres, "gres/accelerator:custom-accelerator=2")
+	}
+}
+
+func TestTranslatorParseDeviceResourcesUsesCoreBitmapAlias(t *testing.T) {
+	const className = "my-cpus"
+	deviceClass := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{Name: className},
+		Spec: resourcev1.DeviceClassSpec{Selectors: []resourcev1.DeviceSelector{{
+			CEL: &resourcev1.CELDeviceSelector{Expression: `device.driver == "dra.cpu"`},
+		}}},
+	}
+	ir := &SlurmJobIR{Pods: corev1.PodList{Items: []corev1.Pod{
+		podWithGPU(resourcev1.ResourceDeviceClassPrefix+className, "2"),
+	}}}
+	translator := translator{
+		Reader:      fake.NewClientBuilder().WithObjects(deviceClass).Build(),
+		ctx:         context.Background(),
+		draRegistry: dra.DefaultRegistry(),
+	}
+
+	if err := translator.parseDeviceResources(ir); err != nil {
+		t.Fatalf("translator.parseDeviceResources() error = %v", err)
+	}
+	if ir.JobInfo.CpuPerTask == nil || *ir.JobInfo.CpuPerTask != 2 {
+		t.Fatalf("translator.parseDeviceResources() CpuPerTask = %v, want 2", ir.JobInfo.CpuPerTask)
+	}
+	if ir.JobInfo.Gres != nil {
+		t.Fatalf("translator.parseDeviceResources() Gres = %q, want nil", *ir.JobInfo.Gres)
+	}
+}
+
+func TestTranslatorParseDeviceResourcesFailsClosedForUnresolvedDeviceClass(t *testing.T) {
+	const className = "my-cpus"
+	ir := &SlurmJobIR{Pods: corev1.PodList{Items: []corev1.Pod{
+		podWithGPU(resourcev1.ResourceDeviceClassPrefix+className, "2"),
+	}}}
+	translator := translator{
+		Reader:      fake.NewClientBuilder().Build(),
+		ctx:         context.Background(),
+		draRegistry: dra.DefaultRegistry(),
+	}
+
+	err := translator.parseDeviceResources(ir)
+	if err == nil || !strings.Contains(err.Error(), `DeviceClass "my-cpus" was not found`) {
+		t.Fatalf("translator.parseDeviceResources() error = %v, want missing DeviceClass error", err)
+	}
+}
+
+func TestTranslatorParseDeviceResourcesFailsClosedForNonMatchingDeviceClass(t *testing.T) {
+	const className = "my-cpus"
+	deviceClass := &resourcev1.DeviceClass{ObjectMeta: metav1.ObjectMeta{Name: className}}
+	ir := &SlurmJobIR{Pods: corev1.PodList{Items: []corev1.Pod{
+		podWithGPU(resourcev1.ResourceDeviceClassPrefix+className, "1"),
+	}}}
+	translator := translator{
+		Reader:      fake.NewClientBuilder().WithObjects(deviceClass).Build(),
+		ctx:         context.Background(),
+		draRegistry: dra.DefaultRegistry(),
+	}
+
+	err := translator.parseDeviceResources(ir)
+	if err == nil || !strings.Contains(err.Error(), `device class "my-cpus" must have exactly one selector`) {
+		t.Fatalf("translator.parseDeviceResources() error = %v, want profile mismatch error", err)
+	}
+}
+
+func TestTranslatorParseDeviceResourcesUsesNVIDIADeviceProfile(t *testing.T) {
+	const className = "gpu.nvidia.com"
+	deviceClass := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{Name: className},
+		Spec: resourcev1.DeviceClassSpec{
+			ExtendedResourceName: ptr.To(nvidiaDevicePlugin),
+			Selectors: []resourcev1.DeviceSelector{{
+				CEL: &resourcev1.CELDeviceSelector{Expression: `device.driver == 'gpu.nvidia.com' && device.attributes['gpu.nvidia.com'].type == 'gpu'`},
+			}},
+		},
+	}
+	ir := &SlurmJobIR{Pods: corev1.PodList{Items: []corev1.Pod{
+		podWithGPU(resourcev1.ResourceDeviceClassPrefix+className, "2"),
+	}}}
+	translator := translator{
+		Reader:      fake.NewClientBuilder().WithObjects(deviceClass).Build(),
+		ctx:         context.Background(),
+		draRegistry: dra.DefaultRegistry(),
+	}
+
+	if err := translator.parseDeviceResources(ir); err != nil {
+		t.Fatalf("translator.parseDeviceResources() error = %v", err)
+	}
+	if ir.JobInfo.Gres == nil || *ir.JobInfo.Gres != "gres/gpu:gpu-nvidia=2" {
+		t.Fatalf("translator.parseDeviceResources() Gres = %v, want %q", ir.JobInfo.Gres, "gres/gpu:gpu-nvidia=2")
+	}
+}
+
+func TestTranslatorParseDeviceResourcesKeepsNVIDIADevicePluginSeparateFromDRAAlias(t *testing.T) {
+	deviceClass := &resourcev1.DeviceClass{
+		ObjectMeta: metav1.ObjectMeta{Name: "gpu.nvidia.com"},
+		Spec: resourcev1.DeviceClassSpec{
+			ExtendedResourceName: ptr.To(nvidiaDevicePlugin),
+			Selectors: []resourcev1.DeviceSelector{{
+				CEL: &resourcev1.CELDeviceSelector{Expression: `device.driver == 'gpu.nvidia.com' && device.attributes['gpu.nvidia.com'].type == 'gpu'`},
+			}},
+		},
+	}
+	ir := &SlurmJobIR{Pods: corev1.PodList{Items: []corev1.Pod{
+		podWithGPU(nvidiaDevicePlugin, "2"),
+	}}}
+	translator := translator{
+		Reader:      fake.NewClientBuilder().WithObjects(deviceClass).Build(),
+		ctx:         context.Background(),
+		draRegistry: dra.DefaultRegistry(),
+	}
+
+	if err := translator.parseDeviceResources(ir); err != nil {
+		t.Fatalf("translator.parseDeviceResources() error = %v", err)
+	}
+	if ir.JobInfo.Gres == nil || *ir.JobInfo.Gres != "gres/gpu=2" {
+		t.Fatalf("translator.parseDeviceResources() Gres = %v, want %q", ir.JobInfo.Gres, "gres/gpu=2")
+	}
+}
+
+func TestTranslatorParseDeviceResourcesCombinesProfileAliases(t *testing.T) {
+	newClass := func(name string) *resourcev1.DeviceClass {
+		return &resourcev1.DeviceClass{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Spec: resourcev1.DeviceClassSpec{
+				Selectors: []resourcev1.DeviceSelector{{
+					CEL: &resourcev1.CELDeviceSelector{Expression: `device.driver == 'gpu.example.com'`},
+				}},
+			},
+		}
+	}
+	ir := &SlurmJobIR{
+		Pods: corev1.PodList{
+			Items: []corev1.Pod{{
+				Spec: corev1.PodSpec{
+					Containers: []corev1.Container{{
+						Resources: corev1.ResourceRequirements{Limits: corev1.ResourceList{
+							corev1.ResourceName(resourcev1.ResourceDeviceClassPrefix + "class-a"): resource.MustParse("1"),
+							corev1.ResourceName(resourcev1.ResourceDeviceClassPrefix + "class-b"): resource.MustParse("2"),
+						}},
+					}},
+				},
+			}},
+		},
+	}
+	translator := translator{
+		Reader:      fake.NewClientBuilder().WithObjects(newClass("class-a"), newClass("class-b")).Build(),
+		ctx:         context.Background(),
+		draRegistry: dra.DefaultRegistry(),
+	}
+
+	if err := translator.parseDeviceResources(ir); err != nil {
+		t.Fatalf("translator.parseDeviceResources() error = %v", err)
+	}
+	if ir.JobInfo.Gres == nil || *ir.JobInfo.Gres != "gres/gpu:gpu-example=3" {
+		t.Fatalf("translator.parseDeviceResources() Gres = %v, want %q", ir.JobInfo.Gres, "gres/gpu:gpu-example=3")
 	}
 }
 
@@ -408,6 +790,7 @@ func Test_parseAnnotations(t *testing.T) {
 					wellknown.AnnotationMemPerNode:  "1Gi",
 					wellknown.AnnotationMinNodes:    "2",
 					wellknown.AnnotationPartition:   "slurm-bridge",
+					wellknown.AnnotationPriority:    "100",
 					wellknown.AnnotationQOS:         "high",
 					wellknown.AnnotationReservation: "training",
 					wellknown.AnnotationTimeLimit:   "30",
@@ -429,11 +812,57 @@ func Test_parseAnnotations(t *testing.T) {
 					MinNodes:    ptr.To(int32(2)),
 					MaxNodes:    ptr.To(int32(4)),
 					Partition:   ptr.To("slurm-bridge"),
+					Priority:    ptr.To(int32(100)),
 					QOS:         ptr.To("high"),
 					Reservation: ptr.To("training"),
 					TimeLimit:   ptr.To(int32(30)),
 					UserId:      ptr.To("1000"),
 					Wckey:       ptr.To("key"),
+				},
+			},
+		},
+		{
+			name: "TimeLimitDurationAnnotation",
+			args: args{
+				slurmJobIR: &SlurmJobIR{},
+				anno: map[string]string{
+					wellknown.AnnotationTimeLimit: "2h",
+				},
+			},
+			wantErr: false,
+			wantRes: SlurmJobIR{
+				JobInfo: SlurmJobIRJobInfo{
+					TimeLimit: ptr.To(int32(120)),
+				},
+			},
+		},
+		{
+			name: "TimeLimitSlurmTimeAnnotation",
+			args: args{
+				slurmJobIR: &SlurmJobIR{},
+				anno: map[string]string{
+					wellknown.AnnotationTimeLimit: "1-00:30:00",
+				},
+			},
+			wantErr: false,
+			wantRes: SlurmJobIR{
+				JobInfo: SlurmJobIRJobInfo{
+					TimeLimit: ptr.To(int32(1470)),
+				},
+			},
+		},
+		{
+			name: "TimeLimitSubMinuteAnnotation",
+			args: args{
+				slurmJobIR: &SlurmJobIR{},
+				anno: map[string]string{
+					wellknown.AnnotationTimeLimit: "30s",
+				},
+			},
+			wantErr: false,
+			wantRes: SlurmJobIR{
+				JobInfo: SlurmJobIRJobInfo{
+					TimeLimit: ptr.To(int32(1)),
 				},
 			},
 		},
@@ -473,6 +902,26 @@ func Test_parseAnnotations(t *testing.T) {
 				slurmJobIR: &SlurmJobIR{},
 				anno: map[string]string{
 					wellknown.AnnotationTimeLimit: "foo",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "BadTimeLimitDurationAnnotation",
+			args: args{
+				slurmJobIR: &SlurmJobIR{},
+				anno: map[string]string{
+					wellknown.AnnotationTimeLimit: "1.5h",
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "BadPriorityAnnotation",
+			args: args{
+				slurmJobIR: &SlurmJobIR{},
+				anno: map[string]string{
+					wellknown.AnnotationPriority: "foo",
 				},
 			},
 			wantErr: true,

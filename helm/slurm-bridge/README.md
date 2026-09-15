@@ -1,6 +1,6 @@
 # slurm-bridge
 
-![Version: 1.2.0-rc1](https://img.shields.io/badge/Version-1.2.0--rc1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 25.11](https://img.shields.io/badge/AppVersion-25.11-informational?style=flat-square)
+![Version: 1.3.0-rc1](https://img.shields.io/badge/Version-1.3.0--rc1-informational?style=flat-square) ![Type: application](https://img.shields.io/badge/Type-application-informational?style=flat-square) ![AppVersion: 1.3.0-rc1](https://img.shields.io/badge/AppVersion-1.3.0--rc1-informational?style=flat-square)
 
 Slurm as a Kubernetes Scheduler
 
@@ -29,17 +29,28 @@ Kubernetes: `>= 1.34.0-0`
 | admission.certManager.enabled | bool | `true` | Enables cert-manager for certificate management. |
 | admission.certManager.renewBefore | string | `"8760h0m0s"` | Certificate renewal time. Should be before the expiration. |
 | admission.enabled | bool | `true` | Enables admission controller. |
-| admission.image | object | `{"repository":"ghcr.io/slinkyproject/slurm-bridge-admission","tag":""}` | The image to use, `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| admission.image | object | `{"pullPolicy":"IfNotPresent","repository":"ghcr.io/slinkyproject/slurm-bridge-admission","tag":""}` | The image to use, `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| admission.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
 | admission.managedNamespaceSelector | object | `{}` | A label selector to select namespaces to be monitored by the pod admission controller. If this is set, managedNamespaces will be ignored. Ref: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors |
 | admission.managedNamespaces | list | `["slurm-bridge"]` | List of namespaces to be monitored by the pod admission controller. Pods created in any of these namespaces will have their `.spec.schedulerName` changed to slurm-bridge. |
 | admission.nodeSelector | map[string]string | `{}` | Node label selector for pod assignment. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector |
+| admission.pdb | object | `{"enabled":false,"maxUnavailable":null,"minAvailable":1}` | PodDisruptionBudget for the admission deployment |
+| admission.pdb.enabled | bool | `false` | Enable PodDisruptionBudget. Only rendered when `replicas` is greater than 1, since a PDB over a single replica blocks node drains. |
+| admission.pdb.maxUnavailable | string | `nil` | Maximum pods that may be unavailable (int or quoted percent). Rendered only when set, and takes precedence over `minAvailable`. |
+| admission.pdb.minAvailable | int | `1` | Minimum pods that must remain available after eviction (int or quoted percent). |
 | admission.priorityClassName | string | `""` | Set the priority class to use. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/#priorityclass |
 | admission.replicas | int | `1` | Set the number of replicas to deploy. |
 | admission.resources | object | `{}` | Set container resource requests and limits for Kubernetes Pod scheduling. Ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#resource-requests-and-limits-of-pod-and-container |
 | admission.tolerations | list | `[]` | Configure pod tolerations. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/ |
 | controllers.affinity | object | `{}` | Set affinity for Kubernetes Pod scheduling. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity |
-| controllers.image | object | `{"repository":"ghcr.io/slinkyproject/slurm-bridge-controllers","tag":""}` | The image to use, `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| controllers.image | object | `{"pullPolicy":"IfNotPresent","repository":"ghcr.io/slinkyproject/slurm-bridge-controllers","tag":""}` | The image to use, `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| controllers.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
+| controllers.leaderElect | bool | `false` | Enables leader election. |
 | controllers.nodeSelector | map[string]string | `{}` | Node label selector for pod assignment. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector |
+| controllers.pdb | object | `{"enabled":false,"maxUnavailable":null,"minAvailable":1}` | PodDisruptionBudget for the controllers deployment |
+| controllers.pdb.enabled | bool | `false` | Enable PodDisruptionBudget. Only rendered when `replicas` is greater than 1, since a PDB over a single replica blocks node drains. |
+| controllers.pdb.maxUnavailable | string | `nil` | Maximum pods that may be unavailable (int or quoted percent). Rendered only when set, and takes precedence over `minAvailable`. |
+| controllers.pdb.minAvailable | int | `1` | Minimum pods that must remain available after eviction (int or quoted percent). |
 | controllers.priorityClassName | string | `""` | Set the priority class to use. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/#priorityclass |
 | controllers.replicas | int | `1` | Set the number of replicas to deploy. |
 | controllers.resources | object | `{}` | Set container resource requests and limits for Kubernetes Pod scheduling. Ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#resource-requests-and-limits-of-pod-and-container |
@@ -49,9 +60,13 @@ Kubernetes: `>= 1.34.0-0`
 | nameOverride | string | `""` | Overrides the name of the release. |
 | namespaceOverride | string | `""` | Overrides the namespace of the release. |
 | scheduler.affinity | object | `{}` | Set affinity for Kubernetes Pod scheduling. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity |
-| scheduler.image | object | `{"repository":"ghcr.io/slinkyproject/slurm-bridge-scheduler","tag":""}` | The image to use, `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| scheduler.featureGates | object | `{"DRAExtendedResource":true,"DynamicResourceAllocation":true,"SchedulerPopFromBackoffQ":false,"SlurmBridgeGenericWorkload":true}` | Scheduler feature gates. SlurmBridgeGenericWorkload requires a supported built-in Workload and PodGroup API at startup; disable it for clusters without those APIs. It is independent of Kubernetes' GenericWorkload feature gate. |
+| scheduler.image | object | `{"pullPolicy":"IfNotPresent","repository":"ghcr.io/slinkyproject/slurm-bridge-scheduler","tag":""}` | The image to use, `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| scheduler.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
 | scheduler.leaderElect | bool | `false` | Enables leader election. |
 | scheduler.nodeSelector | map[string]string | `{}` | Node label selector for pod assignment. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector |
+| scheduler.pdb | object | `{"enabled":false}` | PodDisruptionBudget for the scheduler deployment |
+| scheduler.pdb.enabled | bool | `false` | Enable PodDisruptionBudget |
 | scheduler.priorityClassName | string | `""` | Set the priority class to use. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/#priorityclass |
 | scheduler.replicaCount | int | `1` | Set the number of replicas to deploy. |
 | scheduler.resources | object | `{}` | Set container resource requests and limits for Kubernetes Pod scheduling. Ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#resource-requests-and-limits-of-pod-and-container |
@@ -60,6 +75,7 @@ Kubernetes: `>= 1.34.0-0`
 | schedulerConfig.mcsLabel | string | `"kubernetes"` | Set the Slurm MCS Label to use for external jobs. Ref: https://slurm.schedmd.com/sbatch.html#OPT_mcs-label |
 | schedulerConfig.partition | string | `"slurm-bridge"` | Set the default Slurm partition to use for external jobs. Ref: https://slurm.schedmd.com/sbatch.html#OPT_partition |
 | schedulerConfig.schedulerName | string | `"slurm-bridge-scheduler"` | Set the name of the scheduler. |
-| sharedConfig.slurmJwtSecret | string | `"slurm-bridge-token"` | The secret containing a SLURM_JWT token for authentication. |
+| sharedConfig.deviceProfiles | string | `nil` | DRA DeviceProfiles recognized by Slurm Bridge. A DeviceClass resolves to a profile when its single CEL selector exactly matches `selector`. `name` becomes the Slurm GRES type and must remain stable while allocations using the profile exist. `driver` must be a Kubernetes DRA driver name and `backend.type` must be `core-bitmap` or `indexed-gres`; indexed GRES names must be DNS-1123 labels of at most 60 characters. Leave this `null` to use the built-in profiles shown below, or set it to `[]` to disable all DeviceProfiles explicitly. |
+| sharedConfig.slurmJwtSecret | string | `"slurm-bridge-token"` | The Secret containing the Slurm JWT in the `auth-token` key. The token is mounted and read before each Slurm REST API request to support rotation. |
 | sharedConfig.slurmRestApi | string | `"http://slurm-restapi.slurm:6820"` | The Slurm REST API URL in the form of: `[protocol]://[host]:[port]` |
 

@@ -10,14 +10,13 @@ import (
 	_ "k8s.io/component-base/metrics/prometheus/clientgo" // for rest client metric registration
 	_ "k8s.io/component-base/metrics/prometheus/version"  // for version metric registration
 	"k8s.io/kubernetes/cmd/kube-scheduler/app"
-
-	"github.com/SlinkyProject/slurm-bridge/internal/scheduler/plugins/slurmbridge"
-
 	// Ensure scheme package is initialized.
 	_ "sigs.k8s.io/scheduler-plugins/apis/config/scheme"
+
+	"github.com/SlinkyProject/slurm-bridge/internal/scheduler/plugins/slurmbridge"
 )
 
-// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=create;get;list
+// +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=create;get;list;update
 
 func main() {
 	// Register custom plugins to the scheduler framework.
@@ -26,6 +25,10 @@ func main() {
 	command := app.NewSchedulerCommand(
 		app.WithPlugin(slurmbridge.Name, slurmbridge.New),
 	)
+	// kube-scheduler's own command already owns "--config" for the KubeSchedulerConfiguration
+	// file, so slurm-bridge's own config file path needs a distinct flag name.
+	command.Flags().StringVar(&slurmbridge.ConfigFile, "slurm-bridge-config", slurmbridge.ConfigFile,
+		"Path to the slurm-bridge config file.")
 	code := cli.Run(command)
 	os.Exit(code)
 }

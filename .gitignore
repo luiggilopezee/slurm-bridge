@@ -18,6 +18,7 @@
 bin/*
 build-docs/*
 govulncheck-vulns.csv
+govulncheck-commit-message.txt
 
 # Test binary, built with `go test -c`
 *.test
@@ -26,6 +27,7 @@ govulncheck-vulns.csv
 *.out
 cover.html
 cover.out.tmp
+e2e-artifacts/
 
 # Dependency directories (remove the comment below to include it)
 !vendor/**/zz_generated.*

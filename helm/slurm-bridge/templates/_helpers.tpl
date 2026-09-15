@@ -36,6 +36,13 @@ Create chart name and version as used by the chart label.
 {{- end }}
 
 {{/*
+Allow the release namespace to be overridden
+*/}}
+{{- define "slurm-bridge.namespace" -}}
+{{ default .Release.Namespace .Values.namespaceOverride }}
+{{- end }}
+
+{{/*
 Common labels
 */}}
 {{- define "slurm-bridge.labels" -}}
@@ -44,8 +51,4 @@ helm.sh/chart: {{ include "slurm-bridge.chart" . }}
 app.kubernetes.io/version: {{ .Chart.AppVersion | quote }}
 {{- end }}
 app.kubernetes.io/managed-by: {{ .Release.Service }}
-{{- end }}
-
-{{- define "slurm-bridge.scheduler.name" -}}
-{{ .Values.schedulerConfig.schedulerName | default (print "slurm-bridge-scheduler" .) }}
 {{- end }}

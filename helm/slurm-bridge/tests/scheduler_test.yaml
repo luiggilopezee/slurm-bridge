@@ -1,0 +1,127 @@
+# SPDX-FileCopyrightText: Copyright (C) SchedMD LLC.
+# SPDX-License-Identifier: Apache-2.0
+---
+suite: test scheduler
+templates:
+  - scheduler/deployment.yaml
+  - scheduler/configmap.yaml
+  - scheduler/rbac.yaml
+  - scheduler/service.yaml
+  - scheduler/serviceaccount.yaml
+  - configmap.yaml
+release:
+  name: test-release
+  namespace: test-namespace
+chart:
+  version: 1.2.3
+  appVersion: 1.2.3
+tests:
+  - it: manifests should match snapshot
+    asserts:
+      - matchSnapshot: {}
+  - it: deployment carries config checksum annotations so configmap changes trigger a rolling restart
+    template: scheduler/deployment.yaml
+    asserts:
+      - isNotNullOrEmpty:
+          path: spec.template.metadata.annotations["checksum/config"]
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[0-9a-f]{64}$
+      - isNotNullOrEmpty:
+          path: spec.template.metadata.annotations["checksum/scheduler-config"]
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/scheduler-config"]
+          pattern: ^[0-9a-f]{64}$
+  - it: image pull policy is configurable
+    template: scheduler/deployment.yaml
+    set:
+      scheduler.image.pullPolicy: Always
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].imagePullPolicy
+          value: Always
+  - it: requires built-in Workload APIs by default without enabling the embedded gang scheduler
+    template: scheduler/deployment.yaml
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --feature-gates=DRAExtendedResource=true,DynamicResourceAllocation=true,SchedulerPopFromBackoffQ=false,SlurmBridgeGenericWorkload=true
+  - it: allows an explicit Workload opt-out while preserving other feature gates
+    template: scheduler/deployment.yaml
+    set:
+      scheduler.featureGates.SlurmBridgeGenericWorkload: false
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].args
+          content: --feature-gates=DRAExtendedResource=true,DynamicResourceAllocation=true,SchedulerPopFromBackoffQ=false,SlurmBridgeGenericWorkload=false
+  - it: exposes authenticated metrics over HTTPS
+    template: scheduler/service.yaml
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: https-metrics
+            protocol: TCP
+            port: 10259
+            targetPort: 10259
+  - it: provides a metrics reader role without binding it
+    template: scheduler/rbac.yaml
+    documentSelector:
+      path: metadata.name
+      value: test-release-slurm-bridge-metrics-reader
+    asserts:
+      - equal:
+          path: kind
+          value: ClusterRole
+      - contains:
+          path: rules
+          content:
+            nonResourceURLs:
+              - /metrics
+            verbs:
+              - get
+  - it: scheduler can update its leader election lease
+    template: scheduler/rbac.yaml
+    documentIndex: 0
+    asserts:
+      - contains:
+          path: rules
+          content:
+            apiGroups:
+              - coordination.k8s.io
+            resources:
+              - leases
+            verbs:
+              - create
+              - get
+              - list
+              - update
+  - it: scheduler name is configurable
+    template: scheduler/deployment.yaml
+    set:
+      schedulerConfig:
+        schedulerName: my-scheduler
+    asserts:
+      - equal:
+          path: metadata.name
+          value: my-scheduler
+  - it: an empty scheduler name falls back to the default
+    template: scheduler/deployment.yaml
+    set:
+      schedulerConfig:
+        schedulerName: ""
+    asserts:
+      - equal:
+          path: metadata.name
+          value: slurm-bridge-scheduler
+  - it: mounts the rotating Slurm JWT secret
+    template: scheduler/deployment.yaml
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[0]
+          value:
+            name: SLURM_JWT_FILE
+            value: /var/run/secrets/slurm/auth-token
+      - equal:
+          path: spec.template.spec.volumes[2].secret.secretName
+          value: slurm-bridge-token

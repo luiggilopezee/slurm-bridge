@@ -5,8 +5,8 @@ package slurmcontrol
 
 import (
 	"context"
+	"errors"
 	"fmt"
-	"net/http"
 	"sort"
 	"strings"
 
@@ -17,10 +17,12 @@ import (
 
 	api "github.com/SlinkyProject/slurm-client/api/v0044"
 	slurmclient "github.com/SlinkyProject/slurm-client/pkg/client"
+	slurmerrors "github.com/SlinkyProject/slurm-client/pkg/errors"
 	slurmobject "github.com/SlinkyProject/slurm-client/pkg/object"
 	slurmtypes "github.com/SlinkyProject/slurm-client/pkg/types"
 
 	nodeutils "github.com/SlinkyProject/slurm-bridge/internal/controller/node/utils"
+	"github.com/SlinkyProject/slurm-bridge/internal/dra"
 	"github.com/SlinkyProject/slurm-bridge/internal/nodeinfo"
 	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 )
@@ -41,11 +43,11 @@ type SlurmControlInterface interface {
 	// IsNodeExternal checks if the slurm node is an external node
 	IsNodeExternal(ctx context.Context, node *corev1.Node) (bool, error)
 	// AddNode registers a Kubernetes node in Slurm with the correct CPUs and memory.
-	AddNode(ctx context.Context, node *corev1.Node, nodeInfo *nodeinfo.NodeInfo) error
-	// NodeNeedsRecreate returns true if the Slurm node exists and its cpu, memory, or gres
-	// differ from the desired values (from the Kubernetes node and nodeInfo). Such a node
+	AddNode(ctx context.Context, node *corev1.Node, nodeInfo *nodeinfo.NodeInfo, draInventory []dra.GRESInventory) error
+	// NodeNeedsRecreate returns true if the Slurm node exists and its CPU, memory, or GRES
+	// differ from the desired values. Such a node
 	// must be drained, removed, and re-added to apply the change.
-	NodeNeedsRecreate(ctx context.Context, node *corev1.Node, nodeInfo *nodeinfo.NodeInfo) (bool, error)
+	NodeNeedsRecreate(ctx context.Context, node *corev1.Node, nodeInfo *nodeinfo.NodeInfo, draInventory []dra.GRESInventory) (bool, error)
 	// RemoveNode removes a Kubernetes node from Slurm.
 	RemoveNode(ctx context.Context, node *corev1.Node) error
 }
@@ -73,7 +75,7 @@ func (r *realSlurmControl) NodeExists(ctx context.Context, node *corev1.Node) (b
 	key := slurmobject.ObjectKey(nodeutils.GetSlurmNodeName(node))
 	slurmNode := &slurmtypes.V0044Node{}
 	if err := r.Get(ctx, key, slurmNode); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return false, nil
 		}
 		return false, err
@@ -90,7 +92,7 @@ func (r *realSlurmControl) MakeNodeDrain(ctx context.Context, node *corev1.Node,
 	slurmNode := &slurmtypes.V0044Node{}
 	key := slurmobject.ObjectKey(nodeutils.GetSlurmNodeName(node))
 	if err := r.Get(ctx, key, slurmNode); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return nil
 		}
 		return err
@@ -108,7 +110,7 @@ func (r *realSlurmControl) MakeNodeDrain(ctx context.Context, node *corev1.Node,
 		Reason: ptr.To(nodeReasonPrefix + " " + reason),
 	}
 	if err := r.Update(ctx, slurmNode, req); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return nil
 		}
 		return err
@@ -125,7 +127,7 @@ func (r *realSlurmControl) MakeNodeUndrain(ctx context.Context, node *corev1.Nod
 	key := slurmobject.ObjectKey(nodeutils.GetSlurmNodeName(node))
 	opts := &slurmclient.GetOptions{RefreshCache: true}
 	if err := r.Get(ctx, key, slurmNode, opts); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return nil
 		}
 		return err
@@ -149,7 +151,7 @@ func (r *realSlurmControl) MakeNodeUndrain(ctx context.Context, node *corev1.Nod
 		Reason: ptr.To(nodeReasonPrefix + " " + reason),
 	}
 	if err := r.Update(ctx, slurmNode, req); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return nil
 		}
 		return err
@@ -189,7 +191,7 @@ func (r *realSlurmControl) IsNodeExternal(ctx context.Context, node *corev1.Node
 	key := slurmobject.ObjectKey(nodeutils.GetSlurmNodeName(node))
 	slurmNode := &slurmtypes.V0044Node{}
 	if err := r.Get(ctx, key, slurmNode); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return false, nil
 		}
 		return false, err
@@ -200,35 +202,48 @@ func (r *realSlurmControl) IsNodeExternal(ctx context.Context, node *corev1.Node
 }
 
 // NodeNeedsRecreate implements SlurmControlInterface.
-func (r *realSlurmControl) NodeNeedsRecreate(ctx context.Context, node *corev1.Node, nodeInfo *nodeinfo.NodeInfo) (bool, error) {
+func (r *realSlurmControl) NodeNeedsRecreate(ctx context.Context, node *corev1.Node, nodeInfo *nodeinfo.NodeInfo, draInventory []dra.GRESInventory) (bool, error) {
 	key := slurmobject.ObjectKey(nodeutils.GetSlurmNodeName(node))
 	slurmNode := &slurmtypes.V0044Node{}
 	if err := r.Get(ctx, key, slurmNode); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return false, nil
 		}
 		return false, err
 	}
 
-	desiredCpus := node.Status.Capacity.Cpu().Value()
+	desiredCPU := desiredNodeCPUConfig(node, nodeInfo)
 	desiredMemoryMB := node.Status.Capacity.Memory().Value() / (1024 * 1024)
-	desiredGres := ""
-	if nodeInfo != nil {
-		desiredGres, _ = nodeInfo.GetGresAndGresConf()
+	desiredGRES, err := buildNodeGRESConfig(draInventory)
+	if err != nil {
+		return false, err
 	}
 
-	currentCpus := int64(ptr.Deref(slurmNode.Cpus, 0))
 	currentMemoryMB := ptr.Deref(slurmNode.RealMemory, int64(0))
 	currentGres := ptr.Deref(slurmNode.Gres, "")
+	currentExtra := ptr.Deref(slurmNode.Extra, "")
+	if desiredGRES.extra != "" && currentExtra != "" && !strings.HasPrefix(currentExtra, dra.AppliedInventoryExtraPrefix) {
+		return false, fmt.Errorf("cannot record applied DRA inventory on Slurm node %q: Extra field is already in use", key)
+	}
+	extraChanged := desiredGRES.extra != currentExtra &&
+		(desiredGRES.extra != "" || strings.HasPrefix(currentExtra, dra.AppliedInventoryExtraPrefix))
 
-	if desiredCpus != currentCpus || desiredMemoryMB != currentMemoryMB || desiredGres != currentGres {
+	cpuChanged := desiredCPU.cpus != int(ptr.Deref(slurmNode.Cpus, 0))
+	if desiredCPU.fromDRA {
+		cpuChanged = cpuChanged ||
+			desiredCPU.sockets != int(ptr.Deref(slurmNode.Sockets, 0)) ||
+			desiredCPU.coresPerSocket != int(ptr.Deref(slurmNode.Cores, 0)) ||
+			desiredCPU.threadsPerCore != int(ptr.Deref(slurmNode.Threads, 0))
+	}
+
+	if cpuChanged || desiredMemoryMB != currentMemoryMB || desiredGRES.gres != currentGres || extraChanged {
 		return true, nil
 	}
 	return false, nil
 }
 
 // AddNode implements SlurmControlInterface.
-func (r *realSlurmControl) AddNode(ctx context.Context, node *corev1.Node, nodeInfo *nodeinfo.NodeInfo) error {
+func (r *realSlurmControl) AddNode(ctx context.Context, node *corev1.Node, nodeInfo *nodeinfo.NodeInfo, draInventory []dra.GRESInventory) error {
 	logger := log.FromContext(ctx)
 
 	slurmNodeName := nodeutils.GetSlurmNodeName(node)
@@ -236,28 +251,22 @@ func (r *realSlurmControl) AddNode(ctx context.Context, node *corev1.Node, nodeI
 	slurmNode := &slurmtypes.V0044Node{}
 	err := r.Get(ctx, key, slurmNode, &slurmclient.GetOptions{SkipCache: true})
 	if err == nil {
-		return r.updateNodeFeatures(ctx, node, slurmNode)
+		if err := r.updateNodeFeatures(ctx, node, slurmNode); err != nil {
+			return err
+		}
+		return r.updateNodeTopology(ctx, node, slurmNode)
 	}
-	if !tolerateError(err) {
+	if err != nil && !errors.Is(err, slurmerrors.ErrNotFound) {
 		return err
 	}
 
-	cpus := int(node.Status.Capacity.Cpu().Value())
-	cores := cpus
-	if nodeInfo != nil && len(nodeInfo.CpuMap.AbstractToMachine) > 0 {
-		cpus = len(nodeInfo.CpuMap.MachineToAbstract)
-		cores = len(nodeInfo.CpuMap.AbstractToMachine)
-	}
-	threadsPerCore := 1
-	if cores > 0 {
-		threadsPerCore = cpus / cores
-	}
+	cpuConfig := desiredNodeCPUConfig(node, nodeInfo)
 	memoryBytes := node.Status.Capacity.Memory().Value()
 	memoryMB := memoryBytes / (1024 * 1024)
 
-	gres, gresConf := "", ""
-	if nodeInfo != nil {
-		gres, gresConf = nodeInfo.GetGresAndGresConf()
+	gresConfig, err := buildNodeGRESConfig(draInventory)
+	if err != nil {
+		return err
 	}
 
 	annotations := node.GetAnnotations()
@@ -275,21 +284,25 @@ func (r *realSlurmControl) AddNode(ctx context.Context, node *corev1.Node, nodeI
 	// Create node configuration string
 	// Format: NodeName=<name> CPUs=<cpus> RealMemory=<memory_mb> State=External [Feature=<features>] [Gres=<gres>] [GresConf=<gresconf>]
 	nodeConf := fmt.Sprintf("NodeName=%s Sockets=1 CoresPerSocket=%d ThreadsPerCore=%d CPUs=%d RealMemory=%d State=External",
-		slurmNodeName, cores, threadsPerCore, cpus, memoryMB)
+		slurmNodeName, cpuConfig.coresPerSocket, cpuConfig.threadsPerCore, cpuConfig.cpus, memoryMB)
 	if features != "" {
 		nodeConf += fmt.Sprintf(" Feature=%s", features)
 	}
-	nodeConf += fmt.Sprintf(" Gres=\"%s\"", gres)
-	nodeConf += fmt.Sprintf(" GresConf=\"%s\"", gresConf)
+	if topologySpec, ok := annotations[wellknown.AnnotationNodeTopologySpec]; ok && topologySpec != "" {
+		nodeConf += fmt.Sprintf(" Topology=%s", topologySpec)
+	}
+	nodeConf += fmt.Sprintf(" Gres=\"%s\"", gresConfig.gres)
+	nodeConf += fmt.Sprintf(" GresConf=\"%s\"", gresConfig.gresConf)
 
 	logger.Info("Adding Kubernetes node to Slurm",
 		"node", klog.KObj(node),
 		"slurmNode", slurmNodeName,
-		"cpus", cpus,
+		"cpus", cpuConfig.cpus,
 		"memoryMB", memoryMB,
 		"features", features,
-		"gres", gres,
-		"gresConf", gresConf)
+		"topology", annotations[wellknown.AnnotationNodeTopologySpec],
+		"gres", gresConfig.gres,
+		"gresConf", gresConfig.gresConf)
 
 	req := api.V0044OpenapiCreateNodeReq{
 		NodeConf: nodeConf,
@@ -298,6 +311,97 @@ func (r *realSlurmControl) AddNode(ctx context.Context, node *corev1.Node, nodeI
 		logger.Error(err, "Failed to add node to Slurm", "node", klog.KObj(node),
 			"slurmNode", slurmNodeName)
 		return err
+	}
+	if gresConfig.extra != "" {
+		createdNode := &slurmtypes.V0044Node{V0044Node: api.V0044Node{Name: ptr.To(slurmNodeName)}}
+		req := api.V0044UpdateNodeMsg{Extra: ptr.To(gresConfig.extra)}
+		if err := r.Update(ctx, createdNode, req); err != nil {
+			return fmt.Errorf("could not record applied DRA inventory on Slurm node %q: %w", slurmNodeName, err)
+		}
+	}
+
+	return nil
+}
+
+type nodeCPUConfig struct {
+	sockets        int
+	coresPerSocket int
+	threadsPerCore int
+	cpus           int
+	fromDRA        bool
+}
+
+func desiredNodeCPUConfig(node *corev1.Node, nodeInfo *nodeinfo.NodeInfo) nodeCPUConfig {
+	cpus := int(node.Status.Capacity.Cpu().Value())
+	cores := cpus
+	fromDRA := nodeInfo != nil && len(nodeInfo.CpuMap.AbstractToMachine) > 0
+	if fromDRA {
+		cpus = len(nodeInfo.CpuMap.MachineToAbstract)
+		cores = len(nodeInfo.CpuMap.AbstractToMachine)
+	}
+
+	threadsPerCore := 1
+	if cores > 0 {
+		threadsPerCore = cpus / cores
+	}
+
+	return nodeCPUConfig{
+		sockets:        1,
+		coresPerSocket: cores,
+		threadsPerCore: threadsPerCore,
+		cpus:           cpus,
+		fromDRA:        fromDRA,
+	}
+}
+
+type nodeGRESConfig struct {
+	gres     string
+	gresConf string
+	extra    string
+}
+
+func buildNodeGRESConfig(draInventory []dra.GRESInventory) (nodeGRESConfig, error) {
+	var gresEntries, gresConfEntries []string
+	for _, inventory := range draInventory {
+		gres, gresConf, err := inventory.SlurmConfig()
+		if err != nil {
+			return nodeGRESConfig{}, err
+		}
+		gresEntries = append(gresEntries, gres)
+		gresConfEntries = append(gresConfEntries, gresConf)
+	}
+
+	config := nodeGRESConfig{
+		gres:     strings.Join(gresEntries, ","),
+		gresConf: strings.Join(gresConfEntries, "+"),
+	}
+	if len(draInventory) > 0 {
+		extra, err := dra.EncodeAppliedInventory(draInventory)
+		if err != nil {
+			return nodeGRESConfig{}, err
+		}
+		config.extra = extra
+	}
+	return config, nil
+}
+
+// updateNodeTopology updates an existing Slurm node so its dynamic topology
+// matches the Kubernetes node topology annotation.
+func (r *realSlurmControl) updateNodeTopology(ctx context.Context, node *corev1.Node, slurmNode *slurmtypes.V0044Node) error {
+	logger := log.FromContext(ctx)
+
+	topologySpec := node.GetAnnotations()[wellknown.AnnotationNodeTopologySpec]
+	if ptr.Deref(slurmNode.Topology, "") == topologySpec {
+		return nil
+	}
+
+	req := api.V0044UpdateNodeMsg{
+		TopologyStr: ptr.To(topologySpec),
+	}
+	logger.Info("Updating Slurm node topology to match annotation", "node", klog.KObj(node),
+		"slurmNode", slurmNode.GetKey(), "topology", topologySpec)
+	if err := r.Update(ctx, slurmNode, req); err != nil {
+		return fmt.Errorf("could not update node topology: %w", err)
 	}
 
 	return nil
@@ -333,14 +437,6 @@ func (r *realSlurmControl) updateNodeFeatures(ctx context.Context, node *corev1.
 		return fmt.Errorf("could not update node features: %w", err)
 	}
 
-	// Request reconfigure so Slurm repopulates partition membership from node features
-	// This is necessary due to a bug in Slurm where node feature updates do not update
-	// partition membership. Once the issue is fixed, this will be removed.
-	reconfigureObj := &slurmtypes.V0044Reconfigure{}
-	if err := r.Get(ctx, reconfigureObj.GetKey(), reconfigureObj); err != nil {
-		return fmt.Errorf("could not request Slurm reconfigure: %w", err)
-	}
-
 	return nil
 }
 
@@ -353,7 +449,7 @@ func (r *realSlurmControl) RemoveNode(ctx context.Context, node *corev1.Node) er
 	key := slurmobject.ObjectKey(slurmNodeName)
 	slurmNode := &slurmtypes.V0044Node{}
 	if err := r.Get(ctx, key, slurmNode, &slurmclient.GetOptions{SkipCache: true}); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return nil
 		}
 		return err
@@ -362,7 +458,7 @@ func (r *realSlurmControl) RemoveNode(ctx context.Context, node *corev1.Node) er
 	logger.Info("Removing Kubernetes node from Slurm", "node", klog.KObj(node),
 		"slurmNode", slurmNodeName)
 	if err := r.Delete(ctx, slurmNode); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return nil
 		}
 		return fmt.Errorf("could not remove node from Slurm: %w", err)
@@ -376,7 +472,7 @@ func (r *realSlurmControl) validatePartitionExists(ctx context.Context, partitio
 	partition := &slurmtypes.V0044PartitionInfo{}
 	key := slurmobject.ObjectKey(partitionName)
 	if err := r.Get(ctx, key, partition); err != nil {
-		if tolerateError(err) {
+		if errors.Is(err, slurmerrors.ErrNotFound) {
 			return fmt.Errorf("partition not found")
 		}
 		return err
@@ -428,17 +524,4 @@ func NewControl(client slurmclient.Client) SlurmControlInterface {
 	return &realSlurmControl{
 		Client: client,
 	}
-}
-
-func tolerateError(err error) bool {
-	if err == nil {
-		return true
-	}
-	errText := err.Error()
-	notFound := http.StatusText(http.StatusNotFound)
-	noContent := http.StatusText(http.StatusNoContent)
-	if strings.Contains(errText, notFound) || strings.Contains(errText, noContent) {
-		return true
-	}
-	return false
 }

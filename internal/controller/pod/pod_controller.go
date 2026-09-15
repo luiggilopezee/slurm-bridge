@@ -26,6 +26,7 @@ import (
 
 	"github.com/SlinkyProject/slurm-bridge/internal/controller/pod/slurmcontrol"
 	"github.com/SlinkyProject/slurm-bridge/internal/utils/durationstore"
+	"github.com/SlinkyProject/slurm-bridge/internal/utils/ratelimiter"
 )
 
 const (
@@ -62,7 +63,8 @@ type PodReconciler struct {
 	eventRecorder record.EventRecorderLogger
 }
 
-// +kubebuilder:rbac:groups="",resources=pods,verbs=delete;get;list;patch;update;watch
+// +kubebuilder:rbac:groups="",resources=pods,verbs=delete;get;list;patch;watch
+// +kubebuilder:rbac:groups="",resources=pods/finalizers,verbs=patch;update
 // +kubebuilder:rbac:groups=resource.k8s.io,resources=resourceclaims,verbs=delete;get;list;watch
 
 // Reconcile is part of the main kubernetes reconciliation loop which aims to
@@ -110,6 +112,7 @@ func (r *PodReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		WatchesRawSource(source.Channel(r.EventCh, podEventHandler)).
 		WithOptions(controller.Options{
 			MaxConcurrentReconciles: maxConcurrentReconciles,
+			RateLimiter:             ratelimiter.Build[reconcile.Request](),
 		}).
 		Complete(r)
 }

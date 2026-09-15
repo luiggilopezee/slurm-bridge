@@ -1,0 +1,138 @@
+# SPDX-FileCopyrightText: Copyright (C) SchedMD LLC.
+# SPDX-License-Identifier: Apache-2.0
+---
+suite: test admission
+templates:
+  - admission/deployment.yaml
+  - admission/poddisruptionbudget.yaml
+  - admission/rbac.yaml
+  - admission/service.yaml
+  - admission/webhook.yaml
+  - configmap.yaml
+release:
+  name: test-release
+  namespace: test-namespace
+chart:
+  version: 1.2.3
+  appVersion: 1.2.3
+tests:
+  - it: manifests should match snapshot
+    set:
+      admission:
+        enabled: true
+    asserts:
+      - matchSnapshot: {}
+  - it: deployment carries a config checksum annotation so configmap changes trigger a rolling restart
+    template: admission/deployment.yaml
+    set:
+      admission:
+        enabled: true
+    asserts:
+      - isNotNullOrEmpty:
+          path: spec.template.metadata.annotations["checksum/config"]
+      - matchRegex:
+          path: spec.template.metadata.annotations["checksum/config"]
+          pattern: ^[0-9a-f]{64}$
+  - it: image pull policy is configurable
+    template: admission/deployment.yaml
+    set:
+      admission:
+        enabled: true
+        image:
+          pullPolicy: Always
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].imagePullPolicy
+          value: Always
+  - it: exposes metrics over HTTP
+    template: admission/service.yaml
+    set:
+      admission.enabled: true
+    asserts:
+      - contains:
+          path: spec.ports
+          content:
+            name: metrics
+            protocol: TCP
+            port: 8080
+            targetPort: 8080
+  - it: applies the admission resources to the admission container
+    template: admission/deployment.yaml
+    set:
+      admission:
+        enabled: true
+        resources:
+          requests:
+            cpu: 1
+            memory: 1Gi
+          limits:
+            cpu: 2
+            memory: 4Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 1
+              memory: 1Gi
+            limits:
+              cpu: 2
+              memory: 4Gi
+  - it: does not apply the controllers resources to the admission container
+    template: admission/deployment.yaml
+    set:
+      admission.enabled: true
+      controllers.resources:
+        limits:
+          cpu: 9
+    asserts:
+      - isNull:
+          path: spec.template.spec.containers[0].resources
+  - it: pdb is not rendered for a single replica, which would block node drains
+    template: admission/poddisruptionbudget.yaml
+    set:
+      admission:
+        enabled: true
+        replicas: 1
+        pdb:
+          enabled: true
+    asserts:
+      - hasDocuments:
+          count: 0
+  - it: pdb defaults to minAvailable when maxUnavailable is unset
+    template: admission/poddisruptionbudget.yaml
+    set:
+      admission:
+        enabled: true
+        replicas: 2
+        pdb:
+          enabled: true
+    asserts:
+      - equal:
+          path: spec.minAvailable
+          value: 1
+      - notExists:
+          path: spec.maxUnavailable
+  - it: pdb maxUnavailable takes precedence over minAvailable
+    template: admission/poddisruptionbudget.yaml
+    set:
+      admission:
+        enabled: true
+        replicas: 2
+        pdb:
+          enabled: true
+          maxUnavailable: 1
+    asserts:
+      - equal:
+          path: spec.maxUnavailable
+          value: 1
+      - notExists:
+          path: spec.minAvailable
+  - it: does not expose the Slurm JWT to admission
+    template: admission/deployment.yaml
+    set:
+      admission:
+        enabled: true
+    asserts:
+      - isNull:
+          path: spec.template.spec.containers[0].env

@@ -49,7 +49,11 @@ This project enables the best of both workload managers. It contains a
 workloads from Kubernetes, which allows for co-location of Kubernetes
 and Slurm workloads within the same cluster. This means the same
 hardware can be used to run both traditional HPC and cloud-like
-workloads, reducing operating costs.
+workloads, reducing operating costs. On hybrid nodes, the hardware is
+shared over time: a physical node must not run native Slurm user
+workloads and Slurm-bridge-managed Kubernetes user workloads
+simultaneously. Kubernetes and Slurm system daemons are expected to
+remain co-located on those nodes.
 
 Using ``slurm-bridge``, workloads can be submitted from within a
 Kubernetes context as a ``Pod``, ``PodGroup``, ``Job``, ``JobSet``, or
@@ -95,25 +99,72 @@ features:
 Compatibility
 -------------
 
-+------------+-----------------------------------------------------------------------------+
-| Software   | Minimum Version                                                             |
-+============+=============================================================================+
-| Kubernetes | `v1.35 <https://kubernetes.io/blog/2025/12/17/kubernetes-v1-35-release/>`__ |
-+------------+-----------------------------------------------------------------------------+
-| Slurm      | `25.11 <https://www.schedmd.com/slurm-version-25-11-0-is-now-available/>`__ |
-+------------+-----------------------------------------------------------------------------+
+Each minor release supports all Kubernetes minor versions that are
+`supported upstream <https://kubernetes.io/releases/>`__ when it is
+released, starting with Kubernetes 1.35. That set is recorded for each
+minor release. Support for newer Kubernetes minors may be backported in
+a patch release after end-to-end validation; these backports are
+optional.
+
+========= =============== =============== ===============
+Release   Kubernetes 1.35 Kubernetes 1.36 Kubernetes 1.37
+========= =============== =============== ===============
+``1.3.X`` ✓               ✓               ✓
+``1.2.X`` ✓               ✓               —
+``1.1.X`` ✓               ✓               —
+``1.0.X`` ✓               ✓               —
+========= =============== =============== ===============
+
+✓ means supported; — means unsupported. ``X`` denotes the patch version.
+Use the latest patch release in each minor release series. Backported
+support is marked with the first supporting patch version.
+
++-----------+-----------------------------------------------------------------------------------+
+| Release   | Minimum Slurm (Data Parser)                                                       |
++===========+===================================================================================+
+| ``1.3.X`` | `25.11 <https://www.schedmd.com/slurm-version-25-11-0-is-now-available/>`__       |
+|           | (`v0.0.44 <https://slurm.schedmd.com/rest_clients.html#data_parser_lifecycle>`__) |
++-----------+-----------------------------------------------------------------------------------+
+| ``1.2.X`` | `25.11 <https://www.schedmd.com/slurm-version-25-11-0-is-now-available/>`__       |
+|           | (`v0.0.44 <https://slurm.schedmd.com/rest_clients.html#data_parser_lifecycle>`__) |
++-----------+-----------------------------------------------------------------------------------+
+| ``1.1.X`` | `25.11 <https://www.schedmd.com/slurm-version-25-11-0-is-now-available/>`__       |
+|           | (`v0.0.44 <https://slurm.schedmd.com/rest_clients.html#data_parser_lifecycle>`__) |
++-----------+-----------------------------------------------------------------------------------+
+| ``1.0.X`` | `25.11 <https://www.schedmd.com/slurm-version-25-11-0-is-now-available/>`__       |
+|           | (`v0.0.44 <https://slurm.schedmd.com/rest_clients.html#data_parser_lifecycle>`__) |
++-----------+-----------------------------------------------------------------------------------+
 
 Limitations
 -----------
 
-- Exclusive, whole node allocations are made for each pod.
-- Only supports the following DRA drivers:
-
-  - `DRA Driver
-    CPU <https://github.com/kubernetes-sigs/dra-driver-cpu>`__ for CPUs.
-  - `DRA Example
-    Driver <https://github.com/kubernetes-sigs/dra-example-driver>`__
-    for GPUs.
+- Bridge jobs use exclusive, whole-node allocations by default.
+  Workloads that request non-exclusive placement always use Slurm MCS
+  workload isolation.
+- Supports `DRA Driver
+  CPU <https://github.com/kubernetes-sigs/dra-driver-cpu>`__ for CPUs,
+  plus indexed GPU and accelerator drivers mapped to Slurm GRES through
+  configured device profiles. The chart includes profiles for `DRA
+  Example
+  Driver <https://github.com/kubernetes-sigs/dra-example-driver>`__ and
+  `NVIDIA DRA
+  Driver <https://github.com/kubernetes-sigs/dra-driver-nvidia-gpu>`__
+  GPUs by default, and retains its specialized `NVIDIA DRA
+  Driver <https://github.com/NVIDIA/k8s-dra-driver-gpu>`__ path.
+- NVIDIA GPU backend selection is resource-name based:
+  ``deviceclass.resource.kubernetes.io/gpu.nvidia.com`` selects the
+  NVIDIA DRA DeviceClass, while ``nvidia.com/gpu`` selects the NVIDIA
+  device plugin. ``DeviceClass.spec.extendedResourceName`` aliases are
+  not resolved by ``slurm-bridge``; use the implicit DeviceClass
+  resource name for NVIDIA DRA.
+- Native ``cpu`` requests do not activate CPU DRA. Pods must explicitly
+  request ``deviceclass.resource.kubernetes.io/dra.cpu`` and cannot
+  combine it with native ``cpu`` requests or limits.
+- Native CPU requests reserve CPU capacity in Slurm, but do not
+  constrain the container to Slurm’s allocated CPU set. Native
+  containers share CPUs not claimed through DRA, so native Slurm
+  allocations may overlap their effective CPU sets; use CPU DRA for
+  aligned CPU isolation.
 
 Installation
 ------------
@@ -124,14 +175,14 @@ Create a secret for slurm-bridge to communicate with Slurm.
 
    export SLURM_JWT=$(scontrol token username=slurm lifespan=infinite)
    kubectl create namespace slurm-bridge
-   kubectl create secret generic slurm-bridge-jwt-token --namespace=slinky --from-literal="auth-token=$SLURM_JWT" --type=Opaque
+   kubectl create secret generic slurm-bridge-jwt-token --namespace=slurm --from-literal="auth-token=$SLURM_JWT" --type=Opaque
 
 Install the slurm-bridge scheduler:
 
 .. code:: sh
 
    helm install slurm-bridge oci://ghcr.io/slinkyproject/charts/slurm-bridge \
-     --namespace=slinky --create-namespace
+     --namespace=slurm --create-namespace
 
 For additional instructions, see the
 `quickstart <quickstart.html>`__ guide.
