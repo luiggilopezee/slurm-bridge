@@ -6,6 +6,7 @@ package slurmjobir
 import (
 	"context"
 	"fmt"
+	"net/mail"
 	"strings"
 
 	corev1 "k8s.io/api/core/v1"
@@ -36,6 +37,8 @@ type SlurmJobIRJobInfo struct {
 	GroupId      *string
 	JobName      *string
 	Licenses     *string
+	MailUser     *string
+	MailType     []string
 	MemPerNode   *int64 // memory in megabytes
 	MinNodes     *int32
 	MaxNodes     *int32
@@ -144,7 +147,29 @@ func TranslateToSlurmJobIR(c client.Client, ctx context.Context, pod *corev1.Pod
 	slurmJobIR.RootPOM = *rootPOM
 	parsePodsCpuAndMemory(slurmJobIR)
 	parseGPUDevicePlugin(slurmJobIR)
-	err = t.applySlurmAnnotations(slurmJobIR, pod, rootPOM)
+	annotations := make(map[string]string, len(rootPOM.Annotations)+2)
+	for key, value := range rootPOM.Annotations {
+		annotations[key] = value
+	}
+	for _, key := range []string{wellknown.AnnotationMailUser, wellknown.AnnotationMailType} {
+		if value, ok := pod.Annotations[key]; ok {
+			annotations[key] = value
+		}
+	}
+	if rootPOM.TypeMeta != podgroup_v1alpha2 {
+		err = parseAnnotations(slurmJobIR, annotations)
+	} else {
+		err = t.applySlurmAnnotations(slurmJobIR, pod, rootPOM)
+		if err == nil {
+			mailAnnotations := make(map[string]string, 2)
+			for _, key := range []string{wellknown.AnnotationMailUser, wellknown.AnnotationMailType} {
+				if value, ok := pod.Annotations[key]; ok {
+					mailAnnotations[key] = value
+				}
+			}
+			err = parseAnnotations(slurmJobIR, mailAnnotations)
+		}
+	}
 	return slurmJobIR, err
 }
 
@@ -246,6 +271,32 @@ func parseAnnotations(slurmJobIR *SlurmJobIR, anno map[string]string) error {
 			slurmJobIR.JobInfo.JobName = &value
 		case wellknown.AnnotationLicenses:
 			slurmJobIR.JobInfo.Licenses = &value
+		case wellknown.AnnotationMailUser:
+			address, err := mail.ParseAddress(value)
+			if err != nil || address.Address != value || !strings.Contains(value, "@") || strings.ContainsAny(value, "\r\n") {
+				return fmt.Errorf("%s must be a single bare email address (for example user@example.org)", key)
+			}
+			slurmJobIR.JobInfo.MailUser = &value
+		case wellknown.AnnotationMailType:
+			events := strings.Split(value, ",")
+			seen := make(map[string]bool, len(events))
+			var mailTypes []string
+			for _, event := range events {
+				event = strings.TrimSpace(event)
+				switch event {
+				case "NONE", "BEGIN", "END", "FAIL", "REQUEUE", "ALL", "INVALID_DEPEND", "STAGE_OUT", "TIME_LIMIT", "TIME_LIMIT_90", "TIME_LIMIT_80", "TIME_LIMIT_50", "ARRAY_TASKS":
+				default:
+					return fmt.Errorf("%s: unsupported event %q; use NONE, BEGIN, END, FAIL, REQUEUE, ALL, INVALID_DEPEND, STAGE_OUT, TIME_LIMIT, TIME_LIMIT_90, TIME_LIMIT_80, TIME_LIMIT_50, or ARRAY_TASKS", key, event)
+				}
+				if !seen[event] {
+					mailTypes = append(mailTypes, event)
+					seen[event] = true
+				}
+			}
+			if seen["NONE"] && len(mailTypes) > 1 {
+				return fmt.Errorf("%s: NONE cannot be combined with other events", key)
+			}
+			slurmJobIR.JobInfo.MailType = mailTypes
 		case wellknown.AnnotationMaxNodes:
 			num, err := ConvStrTo32(value)
 			if err != nil {
