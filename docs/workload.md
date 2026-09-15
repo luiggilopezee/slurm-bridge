@@ -391,7 +391,9 @@ request execution-start mail; it is not a submission receipt.
   rejected with a diagnostic identifying the annotation.
 - `NONE` explicitly disables mail and cannot be combined with other events.
   `ALL` expands to `BEGIN,END,FAIL,REQUEUE,STAGE_OUT,INVALID_DEPEND`; time-limit
-  warnings and `ARRAY_TASKS` must be requested separately.
+  warnings and `ARRAY_TASKS` must be requested separately. This includes invalid
+  dependencies, matching `parse_mail_type()` in the
+  [Slurm 25.11 parser](https://github.com/SchedMD/slurm/blob/slurm-25-11-0-1/src/common/proc_args.c).
 - For these two annotations only, the scheduling Pod takes precedence over the
   root owner, independently for each key. For built-in PodGroups, the normal
   PodGroup/controller/Workload sources are applied first, followed by mail-only

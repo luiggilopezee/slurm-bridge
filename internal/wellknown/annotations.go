@@ -46,7 +46,9 @@ const (
 	// AnnotationLicenses sets the licenses
 	// for the Slurm external job.
 	AnnotationLicenses = SlurmJobPrefix + "licenses"
+	// AnnotationMailUser sets a single bare email recipient for native Slurm mail.
 	AnnotationMailUser = SlurmJobPrefix + "mail-user"
+	// AnnotationMailType sets comma-separated Slurm mail events; NONE must stand alone.
 	AnnotationMailType = SlurmJobPrefix + "mail-type"
 	// AnnotationMaxNodes sets the maximum number of
 	// nodes for the external job

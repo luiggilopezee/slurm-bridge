@@ -658,7 +658,8 @@ func TestSubmitJobMail(t *testing.T) {
 		{name: "events only", events: []string{"END", "FAIL"}, want: []string{"END", "FAIL"}},
 		{name: "start and completion", user: ptr.To("user@nih.gov"), events: []string{"BEGIN", "END", "FAIL"}, want: []string{"BEGIN", "END", "FAIL"}},
 		{name: "none", events: []string{"NONE"}, want: []string{}},
-		{name: "all", events: []string{"ALL", "END"}, want: []string{"BEGIN", "END", "FAIL", "REQUEUE", "STAGE_OUT", "INVALID_DEPENDENCY"}},
+		{name: "all includes invalid dependency", events: []string{"ALL"}, want: []string{"BEGIN", "END", "FAIL", "REQUEUE", "STAGE_OUT", "INVALID_DEPENDENCY"}},
+		{name: "all deduplicates explicit events", events: []string{"ALL", "END", "INVALID_DEPEND"}, want: []string{"BEGIN", "END", "FAIL", "REQUEUE", "STAGE_OUT", "INVALID_DEPENDENCY"}},
 		{name: "timeouts", events: []string{"TIME_LIMIT", "TIME_LIMIT_90", "TIME_LIMIT_80", "TIME_LIMIT_50"}, want: []string{"TIME=100%", "TIME=90%", "TIME=80%", "TIME=50%"}},
 		{name: "other events", events: []string{"REQUEUE", "STAGE_OUT", "ARRAY_TASKS", "INVALID_DEPEND"}, want: []string{"REQUEUE", "STAGE_OUT", "ARRAY_TASKS", "INVALID_DEPENDENCY"}},
 	}
