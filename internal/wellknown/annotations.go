@@ -46,6 +46,8 @@ const (
 	// AnnotationLicenses sets the licenses
 	// for the Slurm external job.
 	AnnotationLicenses = SlurmJobPrefix + "licenses"
+	AnnotationMailUser = SlurmJobPrefix + "mail-user"
+	AnnotationMailType = SlurmJobPrefix + "mail-type"
 	// AnnotationMaxNodes sets the maximum number of
 	// nodes for the external job
 	AnnotationMaxNodes = SlurmJobPrefix + "max-nodes"

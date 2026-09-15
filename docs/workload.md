@@ -16,6 +16,11 @@
   - [Pod grouping](#pod-grouping)
     - [Other controller owners](#other-controller-owners)
   - [PodGroup (1.36+)](#podgroup-136)
+  - [Slurm Email Notifications](#slurm-email-notifications)
+    - [Annotation Contract](#annotation-contract)
+    - [Delivery and Trust](#delivery-and-trust)
+    - [Lifecycle Semantics](#lifecycle-semantics)
+    - [Confirmed Submission Follow-up](#confirmed-submission-follow-up)
   - [JobSets](#jobsets)
   - [PodGroup coscheduling](#podgroup-coscheduling)
   - [LeaderWorkerSet](#leaderworkerset)
@@ -146,6 +151,9 @@ selected controller (Job or JobSet) -> Workload**.
 
 Keys that do not conflict are combined.
 
+The two [mail annotations](#slurm-email-notifications) additionally accept
+per-key overrides on the scheduling Pod, including Job Pod templates.
+
 ### Supported Slurm job annotations
 
 | Purpose                 | Annotation suffixes                                                                   |
@@ -154,6 +162,7 @@ Keys that do not conflict are combined.
 | Scheduling policy       | `constraints`, `exclusive`, `licenses`, `partition`, `priority`, `qos`, `reservation` |
 | Resources               | `cpu-per-task`, `gres`, `max-nodes`, `mem-per-node`, `min-nodes`                      |
 | Naming and duration     | `job-name`, `timelimit`                                                               |
+| Native mail             | `mail-user`, `mail-type`                                                              |
 
 Prefix every suffix with `slurmjob.slinky.slurm.net/`; for example,
 `slurmjob.slinky.slurm.net/account`. Node counts, priority, and `timelimit` are
@@ -164,6 +173,7 @@ exclusive placement is the default.
 Annotations can update a Slurm job while it is pending. Slurm validates each
 change. If it rejects an update, the previous Slurm job value remains in effect.
 Once Slurm allocates the job, treat its annotations and Pod membership as fixed.
+Mail settings are an exception: the bridge sends them only at creation.
 
 ### Scheduler-managed Pod metadata
 
@@ -198,9 +208,10 @@ owner chain -> the Pod itself**. When no recognized workload exists, the highest
 readable controller remains the annotation source for the per-Pod external job.
 
 For Jobs, JobSets, and LeaderWorkerSets, annotations belong on the top-level
-workload object, not its Pod template or generated child objects.
+workload object, not its Pod template or generated child objects, except for the
+mail overrides described below.
 
-For grouped workloads:
+For grouped workloads (excluding the mail-only Pod overrides):
 
 - **JobSet:** JobSet annotations apply to every per-Pod external job.
   Annotations on generated Jobs or Pods are ignored.
@@ -331,6 +342,144 @@ PodGroup under that Workload. Each gang still submits a separate Slurm external
 job (distinct job ID on the pods), but all share the same Slurm job **name** in
 `squeue`. Use the Workload for **shared** parameters (partition, account, QOS,
 time limit) and **PodGroup** for per-gang identifiers.
+
+## Slurm Email Notifications
+
+Native Slurm mail reports the lifecycle of the external Slurm allocation. For
+Kubernetes Jobs, put the optional mail annotations on the Pod template:
+
+```yaml
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: mail-example
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      annotations:
+        slurmjob.slinky.slurm.net/mail-user: "user@nih.gov"
+        slurmjob.slinky.slurm.net/mail-type: "END,FAIL"
+    spec:
+      schedulerName: slurm-bridge-scheduler
+      restartPolicy: Never
+      containers:
+        - name: work
+          image: busybox:1.37
+          command: ["sh", "-c", "sleep 30"]
+          resources:
+            requests:
+              cpu: "1"
+              memory: 64Mi
+```
+
+For a bare Pod, use `metadata.annotations`. Applications such as Boltz2 should
+pass their authorized per-job notification address into the manifest builder and
+set `spec.template.metadata.annotations` before creating the Job. Add `BEGIN` to
+request execution-start mail; it is not a submission receipt.
+
+### Annotation Contract
+
+- `slurmjob.slinky.slurm.net/mail-user`: one bare email address, such as
+  `user+job@nih.gov`. Empty values, display names, address lists, local
+  usernames, surrounding whitespace, and line breaks are rejected.
+- `slurmjob.slinky.slurm.net/mail-type`: comma-separated, case-sensitive event
+  names. Supported values are `NONE`, `BEGIN`, `END`, `FAIL`, `REQUEUE`, `ALL`,
+  `INVALID_DEPEND`, `STAGE_OUT`, `TIME_LIMIT`, `TIME_LIMIT_90`, `TIME_LIMIT_80`,
+  `TIME_LIMIT_50`, and `ARRAY_TASKS`. Whitespace around events is trimmed and
+  duplicates are removed. Empty or unknown events (including `SUBMIT`) are
+  rejected with a diagnostic identifying the annotation.
+- `NONE` explicitly disables mail and cannot be combined with other events.
+  `ALL` expands to `BEGIN,END,FAIL,REQUEUE,STAGE_OUT,INVALID_DEPEND`; time-limit
+  warnings and `ARRAY_TASKS` must be requested separately.
+- For these two annotations only, the scheduling Pod takes precedence over the
+  root owner, independently for each key. For built-in PodGroups, the normal
+  PodGroup/controller/Workload sources are applied first, followed by mail-only
+  Pod overrides. Other annotations retain their existing resolution rules.
+  Invalid annotation values prevent Slurm submission and appear in scheduler
+  diagnostics; Kubernetes API acceptance is not validation. Built-in PodGroup
+  sources are validated in order, even if a later source overrides them.
+- Missing keys remain unset in the Slurm request. A recipient alone does not
+  enable events; event types alone leave recipient selection to Slurm defaults.
+  Set both for deterministic application routing. With neither annotation,
+  existing behavior is unchanged.
+
+The bridge sets `mail_user` and `mail_type` on the creation request using the
+pinned Slurm client's v0.0.44 API. `NONE` becomes an explicit empty JSON array;
+`TIME_LIMIT[_90|_80|_50]` becomes `TIME=100%`, `TIME=90%`, `TIME=80%`, or
+`TIME=50%`, and `INVALID_DEPEND` becomes `INVALID_DEPENDENCY`. No post-creation
+mail patch is needed, avoiding a race with short allocations.
+
+### Delivery and Trust
+
+Administrators must configure Slurm's
+[`MailProg`](https://slurm.schedmd.com/slurm.conf.html#OPT_MailProg) on the
+Slurm controller hosts, ensure it is executable by the Slurm service account,
+and configure the institutional mail relay, sender policy, and delivery
+monitoring. The application API, bridge, and worker Pods do not need SMTP
+credentials. The bridge passes the recipient as structured request data, never a
+shell command. Custom `MailProg` implementations must also treat their arguments
+as data.
+
+Annotation authors are trusted to choose recipients. Syntax validation does not
+prove ownership or authorize delivery. Applications should use an IdP-verified
+address or an explicitly authorized alternate address; a domain allowlist alone
+is insufficient. Restrict annotation authors through Kubernetes RBAC/admission
+policy and apply relay abuse controls. Addresses are visible to readers of Pod,
+Job, and Slurm metadata, so account for that access and retention boundary.
+
+Native delivery is handled by Slurm and the relay, outside bridge
+reconciliation. The bridge does not retry email or resubmit allocations when
+delivery fails. See the
+[mail verification procedure](./testing.md#native-mail-verification) before
+enabling notifications for users.
+
+### Lifecycle Semantics
+
+| Event                                            | Meaning                                                                   |
+| ------------------------------------------------ | ------------------------------------------------------------------------- |
+| Kubernetes accepts a Job                         | Application acceptance only; no Slurm confirmation mail is emitted.       |
+| Slurm assigns an allocation ID, possibly pending | Confirmed Slurm acceptance; no standard `SUBMIT` mail type exists.        |
+| `BEGIN`                                          | Slurm allocation starts, not necessarily application readiness.           |
+| `END` / `FAIL`                                   | Slurm allocation terminates or fails, not Kubernetes Job success/failure. |
+
+**Current limitation:** when all Pods associated with an allocation become
+terminal, the Pod controller deletes/cancels that Slurm allocation. It uses the
+same cleanup operation for Kubernetes `Succeeded` and `Failed` Pods, and does
+not translate container exit codes into Slurm application completion status.
+Native mail can therefore report cancellation after successful Kubernetes work,
+and a Kubernetes failure need not produce Slurm `FAILED` or `FAIL` mail. Do not
+relabel allocation cleanup as successful application completion. Use Kubernetes
+Job conditions or application state for application outcome notifications.
+
+Cancellation while pending or running and time-limit expiry follow Slurm's state
+and mail policy. Verify actual terminal states and delivery on the deployed
+Slurm version, including external-job behavior. Slurm completion also does not
+imply that an application has finished indexing or publishing results.
+
+Mail settings are fixed when an allocation is created; bridge allocation updates
+do not overwrite them. For grouped workloads, use identical settings on all Pods
+sharing an allocation: the Pod that triggers creation selects its mail settings.
+If Slurm permits a requeue, native `REQUEUE` and subsequent lifecycle mail
+belong to that allocation; the bridge does not deduplicate Slurm mail. A
+replacement Pod or Job that creates a new allocation gets its own mail
+lifecycle, even if it represents a retry of the same application job. The
+annotations do not enable requeue support for otherwise ineligible external
+jobs.
+
+### Confirmed Submission Follow-up
+
+A durable confirmed-submission integration is tracked separately in
+[issue #2](https://github.com/luiggilopezee/slurm-bridge/issues/2); it is not
+implemented by the native-mail annotations. The event must follow confirmed
+Slurm creation and durable job-ID recording, use persistent identity and an
+outbox or equivalent durable queue, and support asynchronous retries and
+consumer deduplication across reconciliation and controller restarts. Kubernetes
+Events alone are not a durable delivery queue. Delivery failures must neither
+fail valid workloads nor create duplicate Slurm allocations. Requeues of an
+existing allocation must retain submission identity; new allocations for
+replacement Pods must receive new identities. Crash recovery and restart tests
+are required before this integration can serve as a submission receipt.
 
 ## JobSets
 

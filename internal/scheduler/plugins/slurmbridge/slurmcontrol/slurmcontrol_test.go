@@ -5,6 +5,7 @@ package slurmcontrol
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"reflect"
 	"slices"
@@ -642,6 +643,104 @@ func Test_realSlurmControl_SubmitJob(t *testing.T) {
 				t.Errorf("realSlurmControl.SubmitSlurmJob() got= %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestSubmitJobMail(t *testing.T) {
+	tests := []struct {
+		name   string
+		user   *string
+		events []string
+		want   []string
+	}{
+		{name: "absent"},
+		{name: "recipient only", user: ptr.To("user@nih.gov")},
+		{name: "events only", events: []string{"END", "FAIL"}, want: []string{"END", "FAIL"}},
+		{name: "start and completion", user: ptr.To("user@nih.gov"), events: []string{"BEGIN", "END", "FAIL"}, want: []string{"BEGIN", "END", "FAIL"}},
+		{name: "none", events: []string{"NONE"}, want: []string{}},
+		{name: "all", events: []string{"ALL", "END"}, want: []string{"BEGIN", "END", "FAIL", "REQUEUE", "STAGE_OUT", "INVALID_DEPENDENCY"}},
+		{name: "timeouts", events: []string{"TIME_LIMIT", "TIME_LIMIT_90", "TIME_LIMIT_80", "TIME_LIMIT_50"}, want: []string{"TIME=100%", "TIME=90%", "TIME=80%", "TIME=50%"}},
+		{name: "other events", events: []string{"REQUEUE", "STAGE_OUT", "ARRAY_TASKS", "INVALID_DEPEND"}, want: []string{"REQUEUE", "STAGE_OUT", "ARRAY_TASKS", "INVALID_DEPENDENCY"}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			called := false
+			control := &realSlurmControl{Client: fake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(ctx context.Context, obj object.Object, request any, opts ...client.CreateOption) error {
+					called = true
+					submission := request.(api.V0044JobSubmitReq)
+					if submission.Job.MailType != nil {
+						for _, event := range *submission.Job.MailType {
+							if !event.Valid() {
+								t.Fatalf("invalid v0.0.44 mail event %q", event)
+							}
+						}
+					}
+					payload, err := json.Marshal(submission)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var decoded struct {
+						Job map[string]json.RawMessage `json:"job"`
+					}
+					if err := json.Unmarshal(payload, &decoded); err != nil {
+						t.Fatal(err)
+					}
+					wantFields := map[string]any{}
+					if test.user != nil {
+						wantFields["mail_user"] = *test.user
+					}
+					if test.want != nil {
+						wantFields["mail_type"] = test.want
+					}
+					for _, key := range []string{"mail_user", "mail_type"} {
+						want, present := wantFields[key]
+						got, exists := decoded.Job[key]
+						if present != exists {
+							t.Fatalf("%s presence = %v, want %v", key, exists, present)
+						}
+						if present {
+							encoded, err := json.Marshal(want)
+							if err != nil {
+								t.Fatal(err)
+							}
+							if string(got) != string(encoded) {
+								t.Errorf("%s = %s, want %s", key, got, encoded)
+							}
+						}
+					}
+					obj.(*slurmtypes.V0044JobInfo).JobId = ptr.To(int32(123))
+					return nil
+				},
+			}).Build()}
+			jobID, err := control.SubmitJob(context.Background(), &corev1.Pod{}, &slurmjobir.SlurmJobIR{
+				JobInfo: slurmjobir.SlurmJobIRJobInfo{MailUser: test.user, MailType: test.events},
+			})
+			if err != nil || jobID != 123 || !called {
+				t.Fatalf("SubmitJob() = %d, %v; Create called = %v", jobID, err, called)
+			}
+		})
+	}
+}
+
+func TestUpdateJobPreservesMail(t *testing.T) {
+	called := false
+	control := &realSlurmControl{Client: fake.NewClientBuilder().WithInterceptorFuncs(interceptor.Funcs{
+		Update: func(ctx context.Context, obj object.Object, request any, opts ...client.UpdateOption) error {
+			called = true
+			job := request.(api.V0044JobDescMsg)
+			if job.MailUser != nil || job.MailType != nil {
+				t.Error("allocation update must not overwrite creation-time mail settings")
+			}
+			return nil
+		},
+	}).Build()}
+	pod := st.MakePod().Label(wellknown.LabelExternalJobId, "123").Obj()
+	jobID, err := control.UpdateJob(context.Background(), pod, &slurmjobir.SlurmJobIR{
+		JobInfo: slurmjobir.SlurmJobIRJobInfo{MailUser: ptr.To("other@nih.gov"), MailType: []string{"NONE"}},
+	})
+	if err != nil || jobID != 123 || !called {
+		t.Fatalf("UpdateJob() = %d, %v; Update called = %v", jobID, err, called)
 	}
 }
 
