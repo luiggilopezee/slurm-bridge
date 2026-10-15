@@ -224,6 +224,48 @@ func podWithJobOwner(pod *corev1.Pod, jobName string) *corev1.Pod {
 	return out
 }
 
+func TestTranslateToSlurmJobIR_PodGroupMailAnnotations(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(schedulingv1alpha2.AddToScheme(scheme))
+
+	for _, policy := range []schedulingv1alpha2.PodGroupSchedulingPolicy{
+		{Basic: &schedulingv1alpha2.BasicSchedulingPolicy{}},
+		{Gang: &schedulingv1alpha2.GangSchedulingPolicy{MinCount: 1}},
+	} {
+		pg := newPodGroup("pg", "default", policy)
+		pg.Spec.PodGroupTemplateRef = &schedulingv1alpha2.PodGroupTemplateReference{
+			Workload: &schedulingv1alpha2.WorkloadPodGroupTemplateReference{
+				WorkloadName: "workload", PodGroupTemplateName: "workers",
+			},
+		}
+		workload := &schedulingv1alpha2.Workload{
+			ObjectMeta: metav1.ObjectMeta{Name: "workload", Namespace: "default", Annotations: map[string]string{
+				wellknown.AnnotationMailUser: "workload@nih.gov",
+				wellknown.AnnotationMailType: "END",
+				wellknown.AnnotationQOS:      "workload-qos",
+			}},
+		}
+		job := jobWithAnnotations("job", "default", nil)
+		pod := podWithJobOwner(podWithSchedulingGroup("default", "pod", pg.Name), job.Name)
+		pod.Annotations = map[string]string{
+			wellknown.AnnotationMailUser: "pod@nih.gov",
+			wellknown.AnnotationQOS:      "ignored-pod-qos",
+		}
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pg, workload, job, pod).Build()
+		ir, err := TranslateToSlurmJobIR(reader, context.Background(), pod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ptr.Deref(ir.JobInfo.MailUser, "") != "pod@nih.gov" || len(ir.JobInfo.MailType) != 1 || ir.JobInfo.MailType[0] != "END" {
+			t.Errorf("mail annotations did not preserve Pod override and Workload fallback: %#v", ir.JobInfo)
+		}
+		if ptr.Deref(ir.JobInfo.QOS, "") != "workload-qos" {
+			t.Errorf("non-mail annotation precedence changed: %#v", ir.JobInfo)
+		}
+	}
+}
+
 func TestTranslateToSlurmJobIR_PodGroupAnnotations(t *testing.T) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))

@@ -11,6 +11,7 @@
   - [Setting up your environment](#setting-up-your-environment)
   - [Installing `slurm-bridge` within your environment](#installing-slurm-bridge-within-your-environment)
   - [Cleaning up](#cleaning-up)
+  - [Native Mail Verification](#native-mail-verification)
 
 <!-- mdformat-toc end -->
 
@@ -106,3 +107,59 @@ hack/kind.sh --delete
 ```
 
 To destroy your kind cluster.
+
+## Native Mail Verification
+
+Unit tests cover annotation validation, Job Pod-template precedence, omission of
+unset fields, creation-time mail settings, and serialized v0.0.44 event
+encoding:
+
+```sh
+go test ./internal/utils/slurmjobir ./internal/scheduler/plugins/slurmbridge/slurmcontrol
+```
+
+These tests intercept Slurm requests; they do not prove native delivery. Run the
+following integration procedure on a dedicated test cluster with this bridge
+build and a Slurm version supporting the external-job v0.0.44 API. Do not change
+`MailProg`, drain nodes, or force failures on a production cluster for this
+test.
+
+1. Configure an executable `MailProg` on every Slurm controller host and an
+   approved test recipient/relay. A test capture program may record each
+   argument and stdin to a service-writable, access-restricted log instead of
+   sending mail. Keep each invocation separate and timestamped; never evaluate
+   the arguments as commands. Confirm the configuration using
+   `scontrol show config` and test delivery under the Slurm service account.
+1. Submit the [mail example](./workload.md#slurm-email-notifications) with
+   `BEGIN,END,FAIL,REQUEUE,TIME_LIMIT` and the test recipient. Save the Pod UID
+   and its `scheduler.slinky.slurm.net/slurm-jobid` label as soon as it is
+   assigned. Check `scontrol show job <job-id>` for the recipient and event
+   flags before the workload exits. Inspect `kubectl describe pod <pod>` if
+   scheduling fails.
+1. For each case below, use a fresh Job name and collect Kubernetes Pod/Job
+   status, Slurm controller logs, `sacct -j <job-id> -o JobID,State,ExitCode`,
+   and the captured mail subject/recipient/body or relay receipt. Record the
+   Slurm version and effective `MailProg` configuration alongside the results.
+   Compare native messages to Slurm allocation states, not application outcome.
+
+| Case                 | Action and checks                                                                                                                                                                                                                                             |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Absent annotations   | Remove both annotations. Verify mail fields are not overridden and cluster defaults are unchanged.                                                                                                                                                            |
+| Execution start      | Run the example long enough to observe Slurm `RUNNING`. Verify `BEGIN` delivery and no submission receipt while pending.                                                                                                                                      |
+| Kubernetes success   | Let the container exit zero. Verify Kubernetes success and record Slurm cleanup's terminal state; mail must not be interpreted as application success.                                                                                                        |
+| Kubernetes failure   | Use `sh -c 'exit 1'` with `backoffLimit: 0`. Verify Kubernetes failure and record the allocation cancellation; do not assume it produces native `FAIL`.                                                                                                       |
+| Native Slurm failure | In the isolated cluster, induce a supported allocation failure (for example loss of its test node). Verify a native failure state and requested `FAIL` delivery, separately from container failure.                                                           |
+| Pending cancellation | Keep the test partition's resources occupied until the allocation has an ID and remains `PENDING`, then delete the Kubernetes Job. Verify cleanup, no `BEGIN`, and record cancellation mail policy.                                                           |
+| Running cancellation | Delete the Job after Slurm `RUNNING`. Verify allocation cleanup and record terminal state and mail.                                                                                                                                                           |
+| Timeout              | Set `slurmjob.slinky.slurm.net/timelimit: "1"` on Job metadata and run longer than one minute. Verify Slurm `TIMEOUT` and requested time-limit/terminal mail; account for the cluster's timeout grace period.                                                 |
+| Requeue              | Attempt `scontrol requeue <job-id>` for a running test allocation. If supported, verify identity, restart count, retained settings, and `REQUEUE`/subsequent mail. If external jobs are ineligible, record the rejection instead of claiming requeue support. |
+| Replacement Pod      | Allow a Kubernetes retry to create a new allocation. Verify the new ID receives template mail settings and its own lifecycle messages.                                                                                                                        |
+| Explicit disable     | Repeat with `NONE`. Verify no native notifications, including when a root-owner mail type is overridden by the template.                                                                                                                                      |
+| Delivery failure     | Make only the test mail sink return a failure. Verify workload progress and that no additional allocation is created by the bridge because of mail failure.                                                                                                   |
+
+Do not mark the native delivery, cancellation, timeout, or requeue acceptance
+checks complete without these live observations. The current bridge
+intentionally does not translate Kubernetes success/failure to Slurm completion
+exit codes; see the [lifecycle limitation](./workload.md#lifecycle-semantics).
+Durable submission delivery and restart-deduplication tests belong to
+[the separate follow-up](https://github.com/luiggilopezee/slurm-bridge/issues/2).
