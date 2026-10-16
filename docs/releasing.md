@@ -31,14 +31,17 @@ the fork's actual source. A release manifest must contain:
 | Compatibility     | Tested Kubernetes and Slurm versions, REST API/plugin version, Slurm client version, GPU/DRA drivers and grouping APIs |
 | Acceptance        | Sanitized results for each required case, including skips and unresolved blockers                                      |
 
-This source builds with Go 1.26.6, Kubernetes 1.36.0 libraries, and
-`slurm-client v1.2.2` using v0.0.44 external jobs. The chart declares Kubernetes
-`>=1.34.0-0` and Slurm 25.11 minimums, while the overview currently states
-Kubernetes 1.35. These are not equivalent to a verified support matrix. Until
-those declarations are reconciled using test evidence, state support only for
-the exact tested combinations. Built-in PodGroups require the 1.36 API and
-feature configuration. Do not imply every version above the chart minimum was
-certified.
+The module requires Go 1.26.6 and uses Kubernetes 1.36.0 libraries and
+`slurm-client v1.2.2` with v0.0.44 external jobs. The image builder uses the
+floating `golang:1.26` image; the Makefile's host `GOTOOLCHAIN` does not pin the
+compiler inside Docker. Record the compiler verified from the candidate
+binaries, not the module requirement or the host's `go version`. The chart
+declares Kubernetes `>=1.34.0-0` and Slurm 25.11 minimums, while the overview
+currently states Kubernetes 1.35. These are not equivalent to a verified support
+matrix. Until those declarations are reconciled using test evidence, state
+support only for the exact tested combinations. Built-in PodGroups require the
+1.36 API and feature configuration. Do not imply every version above the chart
+minimum was certified.
 
 ## Build and Record Artifacts
 
@@ -70,9 +73,38 @@ The image build emits `bake-metadata.json`. Generate a credential-free manifest
 from that file and the tested environment versions. Only copy the selected
 fields below, not registry credential files or whole environment dumps.
 
+Before generating the manifest, inspect each component binary from each
+published platform at its candidate image digest. For example, the following
+extracts the scheduler without executing the container or its binary:
+
+```sh
+COMPONENT=scheduler
+PLATFORM=linux/amd64
+DIGEST=$(jq -er --arg component "$COMPONENT" \
+  '.[$component]["containerimage.digest"]' bake-metadata.json)
+IMAGE="$REGISTRY/slurm-bridge-$COMPONENT@$DIGEST"
+docker pull --platform "$PLATFORM" "$IMAGE"
+BINARY_DIR=$(mktemp -d)
+CONTAINER=$(docker create --platform "$PLATFORM" "$IMAGE")
+docker cp "$CONTAINER:/$COMPONENT" "$BINARY_DIR/$COMPONENT"
+docker rm "$CONTAINER"
+go version "$BINARY_DIR/$COMPONENT"
+rm -r "$BINARY_DIR"
+```
+
+Repeat for scheduler, controllers, and admission on both `linux/amd64` and
+`linux/arm64`. Save the image digest, platform, component, and reported compiler
+version in the release evidence. Set `BUILD_GO_VERSION` to the reported version
+(including its `go` prefix) only after confirming all six binaries agree. If
+they differ, stop and reconcile the build or extend the manifest to record
+per-component/platform compiler versions instead of claiming one common value.
+The local `go version <binary>` command reads embedded build information and
+does not execute the foreign-platform binary.
+
 ```sh
 : "${TESTED_KUBERNETES:?Set the Kubernetes version from the acceptance run}"
 : "${TESTED_SLURM:?Set the Slurm version from the acceptance run}"
+: "${BUILD_GO_VERSION:?Set the compiler version verified from every candidate binary}"
 CHART_SHA256=$(shasum -a 256 "slurm-bridge-$VERSION.tgz" | awk '{print $1}')
 jq -e '.["scheduler"]["containerimage.digest"] and
        .["controllers"]["containerimage.digest"] and
@@ -80,14 +112,15 @@ jq -e '.["scheduler"]["containerimage.digest"] and
 jq --arg source "$SOURCE" --arg revision "$REVISION" \
   --arg upstream "$UPSTREAM_REVISION" --arg version "$VERSION" \
   --arg registry "$REGISTRY" --arg chartSHA256 "$CHART_SHA256" \
-  --arg kubernetes "$TESTED_KUBERNETES" --arg slurm "$TESTED_SLURM" '
+  --arg kubernetes "$TESTED_KUBERNETES" --arg slurm "$TESTED_SLURM" \
+  --arg buildGo "$BUILD_GO_VERSION" '
   . as $bake | {
     source: {repository: $source, revision: $revision},
     upstream: {tag: "v1.2.2", revision: $upstream},
     version: $version,
     chart: {version: $version, appVersion: $version,
             artifact: ("slurm-bridge-" + $version + ".tgz"), sha256: $chartSHA256},
-    build: {go: "1.26.6", platforms: ["linux/amd64", "linux/arm64"]},
+    build: {go: $buildGo, platforms: ["linux/amd64", "linux/arm64"]},
     tested: {kubernetes: $kubernetes, slurm: $slurm,
              slurmClient: "v1.2.2", slurmAPI: "v0.0.44"},
     images: (["scheduler", "controllers", "admission"] | map(

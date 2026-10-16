@@ -15,6 +15,50 @@ chart:
   version: 1.2.3
   appVersion: 1.2.3
 tests:
+  - it: both webhooks exclude system and release namespaces despite the managed list
+    template: admission/webhook.yaml
+    set:
+      admission.managedNamespaces: [kube-system, test-namespace]
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          documentIndex: 0
+          path: webhooks[0].namespaceSelector.matchExpressions
+          value:
+            - key: kubernetes.io/metadata.name
+              operator: NotIn
+              values: [kube-system, test-namespace]
+      - equal:
+          documentIndex: 1
+          path: webhooks[0].namespaceSelector.matchExpressions
+          value:
+            - key: kubernetes.io/metadata.name
+              operator: NotIn
+              values: [kube-system, test-namespace]
+  - it: both webhook exclusions follow namespaceOverride despite a managed selector
+    template: admission/webhook.yaml
+    set:
+      namespaceOverride: bridge-system
+      admission.managedNamespaceSelector.matchLabels:
+        bridge-admission: enabled
+    asserts:
+      - hasDocuments:
+          count: 2
+      - equal:
+          documentIndex: 0
+          path: webhooks[0].namespaceSelector.matchExpressions
+          value:
+            - key: kubernetes.io/metadata.name
+              operator: NotIn
+              values: [kube-system, bridge-system]
+      - equal:
+          documentIndex: 1
+          path: webhooks[0].namespaceSelector.matchExpressions
+          value:
+            - key: kubernetes.io/metadata.name
+              operator: NotIn
+              values: [kube-system, bridge-system]
   - it: explicitly admits a non-default application namespace
     template: configmap.yaml
     set:
