@@ -1,11 +1,13 @@
 # Fork Releases
 
-This procedure prepares the immutable release required by issue #6. It does not
-declare an unreleased working tree production-ready. Publication is gated on
-issue #5's terminal-outcome fix and the
-[bridge contract acceptance run](./testing.md#bridge-contract-acceptance). Do
-not publish a successful-completion claim while cleanup still cancels successful
-allocations.
+This procedure prepares immutable fork releases tracked by issue #6. Full
+contract acceptance remains gated on issue #5's terminal-outcome fix and the
+[bridge contract acceptance run](./testing.md#bridge-contract-acceptance). An
+explicitly authorized prerelease may be published before those gates pass,
+provided its release record identifies deferred issues, completed checks, and
+unverified behavior. A prerelease is not a production-readiness or full
+compatibility certification. Do not publish a successful-completion claim while
+cleanup still cancels successful allocations.
 
 ## Release Identity and Compatibility
 
@@ -50,8 +52,10 @@ registry credentials supplied by the operator, and an approved fork registry. Do
 not include credentials in command output or release files. The commands below
 **push candidate images**; run them only as the authorized release operator. Run
 local checks first, then deploy these exact candidate digests to the isolated
-acceptance environment. Publish the release record only after live acceptance
-passes; do not rebuild between acceptance and release publication.
+acceptance environment. Publish a fully accepted release only after live
+acceptance passes. For an authorized prerelease, record the actual acceptance
+status and remaining gates explicitly. Do not rebuild between acceptance and
+release publication without updating the evidence for the new digests.
 
 ```sh
 set -euo pipefail

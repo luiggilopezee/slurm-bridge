@@ -104,8 +104,9 @@ not assume upstream images sharing a version number include fork changes.
 
 Explicitly configure
 [namespace admission](./docs/admission.md#namespace-selection-contract) and run
-the [acceptance canary](./docs/testing.md#bridge-contract-acceptance). Release
-publication remains gated on corrected terminal outcomes in issue #5.
+the [acceptance canary](./docs/testing.md#bridge-contract-acceptance). Full
+lifecycle acceptance remains gated on corrected terminal outcomes in issue #5.
+Prereleases must disclose this limitation and any outstanding acceptance checks.
 
 For additional instructions, see the [quickstart] guide.
 

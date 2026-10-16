@@ -145,8 +145,10 @@ include fork changes.
 Explicitly configure `namespace
 admission <admission.html#namespace-selection-contract>`__ and run
 the `acceptance
-canary <testing.html#bridge-contract-acceptance>`__. Release
-publication remains gated on corrected terminal outcomes in issue #5.
+canary <testing.html#bridge-contract-acceptance>`__. Full lifecycle
+acceptance remains gated on corrected terminal outcomes in issue #5.
+Prereleases must disclose this limitation and any outstanding acceptance
+checks.
 
 For additional instructions, see the
 `quickstart <quickstart.html>`__ guide.
