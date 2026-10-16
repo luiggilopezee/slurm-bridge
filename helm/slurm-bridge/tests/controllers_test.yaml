@@ -14,6 +14,37 @@ chart:
   version: 1.2.3
   appVersion: 1.2.3
 tests:
+  - it: references an externally managed credential without embedding it
+    template: controllers/deployment.yaml
+    set:
+      sharedConfig.slurmJwtSecret: externally-managed-slurm-token
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SLURM_JWT
+            valueFrom:
+              secretKeyRef:
+                name: externally-managed-slurm-token
+                key: auth-token
+  - it: image digest takes precedence over tag
+    template: controllers/deployment.yaml
+    set:
+      controllers.image.repository: registry.example.org/bridge-controllers
+      controllers.image.tag: ignored
+      controllers.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.org/bridge-controllers@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  - it: image tag is used without a digest
+    template: controllers/deployment.yaml
+    set:
+      controllers.image.tag: fork-test
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/slinkyproject/slurm-bridge-controllers:fork-test
   - it: manifests should match snapshot
     asserts:
       - matchSnapshot: {}

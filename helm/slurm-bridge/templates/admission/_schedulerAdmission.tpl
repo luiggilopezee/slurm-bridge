@@ -28,7 +28,11 @@ Define bridge schedulerAdmission image tag
 Determine bridge schedulerAdmission image reference (repo:tag)
 */}}
 {{- define "slurm-bridge.admission.imageRef" -}}
+{{- if .Values.admission.image.digest -}}
+{{ printf "%s@%s" (include "slurm-bridge.admission.image.repository" .) .Values.admission.image.digest | quote }}
+{{- else -}}
 {{ printf "%s:%s" (include "slurm-bridge.admission.image.repository" .) (include "slurm-bridge.admission.image.tag" .) | quote }}
+{{- end -}}
 {{- end }}
 
 {{/*

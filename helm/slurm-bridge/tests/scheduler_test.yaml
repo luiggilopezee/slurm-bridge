@@ -15,6 +15,37 @@ chart:
   version: 1.2.3
   appVersion: 1.2.3
 tests:
+  - it: references an externally managed credential without embedding it
+    template: scheduler/deployment.yaml
+    set:
+      sharedConfig.slurmJwtSecret: externally-managed-slurm-token
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SLURM_JWT
+            valueFrom:
+              secretKeyRef:
+                name: externally-managed-slurm-token
+                key: auth-token
+  - it: image digest takes precedence over tag
+    template: scheduler/deployment.yaml
+    set:
+      scheduler.image.repository: registry.example.org/bridge-scheduler
+      scheduler.image.tag: ignored
+      scheduler.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.org/bridge-scheduler@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  - it: image tag is used without a digest
+    template: scheduler/deployment.yaml
+    set:
+      scheduler.image.tag: fork-test
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/slinkyproject/slurm-bridge-scheduler:fork-test
   - it: manifests should match snapshot
     asserts:
       - matchSnapshot: {}

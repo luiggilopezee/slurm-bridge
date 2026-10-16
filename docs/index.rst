@@ -127,20 +127,26 @@ Limitations
 Installation
 ------------
 
-Create a secret for slurm-bridge to communicate with Slurm.
+Have the infrastructure owner provision the Slurm credential in the
+bridge deployment namespace. Configure only its Secret name with
+``sharedConfig.slurmJwtSecret``; the required key is ``auth-token``. See
+the `credential consumer
+contract <config.html#slurm-credential-consumer-contract>`__ for
+rotation and recovery. Do not put token contents in chart values or
+examples.
 
-.. code:: sh
+For this fork, select a tested immutable release and follow the `release
+installation procedure <releasing.html#downstream-installation>`__,
+pinning the chart source/artifact and all three component image digests.
+Native mail and corrected completion require the matching scheduler and
+controllers; do not assume upstream images sharing a version number
+include fork changes.
 
-   export SLURM_JWT=$(scontrol token username=slurm lifespan=infinite)
-   kubectl create namespace slurm-bridge
-   kubectl create secret generic slurm-bridge-jwt-token --namespace=slurm --from-literal="auth-token=$SLURM_JWT" --type=Opaque
-
-Install the slurm-bridge scheduler:
-
-.. code:: sh
-
-   helm install slurm-bridge oci://ghcr.io/slinkyproject/charts/slurm-bridge \
-     --namespace=slurm --create-namespace
+Explicitly configure `namespace
+admission <admission.html#namespace-selection-contract>`__ and run
+the `acceptance
+canary <testing.html#bridge-contract-acceptance>`__. Release
+publication remains gated on corrected terminal outcomes in issue #5.
 
 For additional instructions, see the
 `quickstart <quickstart.html>`__ guide.
@@ -195,6 +201,7 @@ limitations under the License.
     config.md
     controllers.md
     quickstart.md
+    releasing.md
     scheduler.md
     testing.md
     usermanagement.md

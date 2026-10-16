@@ -7,6 +7,8 @@
 - [Config](#config)
   - [Table of Contents](#table-of-contents)
   - [Overview](#overview)
+  - [Slurm Credential Consumer Contract](#slurm-credential-consumer-contract)
+    - [Rotation and Recovery](#rotation-and-recovery)
   - [Partitions](#partitions)
   - [Nodes](#nodes)
     - [External Nodes](#external-nodes)
@@ -20,6 +22,67 @@
 
 When using slurm-bridge, there are some configuration requirements and
 considerations to be made.
+
+## Slurm Credential Consumer Contract
+
+`sharedConfig.slurmJwtSecret` names an externally managed Kubernetes Secret in
+the **bridge deployment namespace**, not each application namespace. It defaults
+to `slurm-bridge-token`. The required key is **`auth-token`**, whose value is
+injected as **`SLURM_JWT`** using `secretKeyRef`. The chart references the
+Secret; it does not issue a token or create a Secret/SealedSecret.
+
+```yaml
+sharedConfig:
+  slurmJwtSecret: slurm-bridge-jwt-token
+```
+
+Only the Secret name belongs in values. Never put token contents in values,
+examples, command arguments, logs, test fixtures, or release artifacts. Token
+issuance, permissions, lifetime monitoring, and SealedSecret provisioning belong
+to the cluster-infrastructure workflow. Do not duplicate that workflow here.
+
+Scheduler and controllers read `SLURM_JWT` once when constructing their Slurm
+clients. There is no token-file watch, refresh flow, or hot reload. The chart
+also injects the variable into admission, although admission currently does not
+construct a Slurm client. A missing Secret/key prevents container startup; an
+expired or rejected token causes authenticated Slurm operations to fail and may
+delay both scheduling and allocation cleanup. Readiness alone does not prove
+valid Slurm authentication.
+
+### Rotation and Recovery
+
+1. Have the infrastructure owner provision a valid replacement before expiry,
+   retaining an overlap window where supported. Confirm GitOps/Secret-controller
+   synchronization without printing Secret data or decoding the JWT. Updating a
+   Secret does not change running containers' environment. The chart's ConfigMap
+   checksums do not detect Secret-content changes.
+1. In an approved maintenance window, pause new application submissions. Record
+   active Pod/allocation identities for post-rollout checks. Restart controllers
+   and then scheduler, waiting for each rollout before proceeding. Restart
+   admission as well to refresh its injected environment. Use the actual
+   Deployment names if naming overrides are configured:
+
+```sh
+BRIDGE_NAMESPACE=slurm-bridge
+kubectl -n "$BRIDGE_NAMESPACE" rollout restart deployment/slurm-bridge-controllers
+kubectl -n "$BRIDGE_NAMESPACE" rollout status deployment/slurm-bridge-controllers --timeout=180s
+kubectl -n "$BRIDGE_NAMESPACE" rollout restart deployment/slurm-bridge-scheduler
+kubectl -n "$BRIDGE_NAMESPACE" rollout status deployment/slurm-bridge-scheduler --timeout=180s
+kubectl -n "$BRIDGE_NAMESPACE" rollout restart deployment/slurm-bridge-admission
+kubectl -n "$BRIDGE_NAMESPACE" rollout status deployment/slurm-bridge-admission --timeout=180s
+```
+
+1. Check for authentication errors using access-controlled, sanitized
+   operational logs. Confirm successful Slurm reads/reconciliation and run the
+   [acceptance canary](./testing.md#bridge-contract-acceptance). Verify existing
+   allocations remain correctly associated and terminal allocations are released
+   before resuming submissions. A single-replica deployment can have a service
+   interruption; do not claim this is a zero-downtime procedure.
+1. If recovery fails, stop new submissions and ask infrastructure to correct the
+   credential or restore a still-valid previous credential, then repeat the
+   rollout. Restarting with an expired token cannot recover authentication.
+   Reconcile retained workloads before retrying submissions; do not remove
+   finalizers or cancel allocations indiscriminately to clear the symptom.
 
 ## Partitions
 

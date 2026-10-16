@@ -12,11 +12,13 @@ namespaceOverride: ""
 # Default values for slurm-bridge.
 imagePullSecrets: []
 scheduler:
-  # -- The image to use, `${repository}:${tag}`.
+  # -- The image to use, `${repository}@${digest}` when pinned, otherwise `${repository}:${tag}`.
   # Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names
   image:
     repository: ghcr.io/slinkyproject/slurm-bridge-scheduler
     tag: ""
+    # -- Immutable image digest (sha256:...). Takes precedence over tag when set.
+    digest: ""
     # -- Image pull policy.
     pullPolicy: IfNotPresent
   # -- Set the number of replicas to deploy.
@@ -62,11 +64,13 @@ schedulerConfig:
 admission:
   # -- Enables admission controller.
   enabled: true
-  # -- The image to use, `${repository}:${tag}`.
+  # -- The image to use, `${repository}@${digest}` when pinned, otherwise `${repository}:${tag}`.
   # Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names
   image:
     repository: ghcr.io/slinkyproject/slurm-bridge-admission
     tag: ""
+    # -- Immutable image digest (sha256:...). Takes precedence over tag when set.
+    digest: ""
     # -- Image pull policy.
     pullPolicy: IfNotPresent
   # Cert-Manager certificate configurations.
@@ -101,8 +105,7 @@ admission:
   # Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/
   tolerations: []
   # -- List of namespaces to be monitored by the pod admission controller.
-  # Pods created in any of these namespaces will have their `.spec.schedulerName`
-  # changed to slurm-bridge.
+  # Pods using the default scheduler in these namespaces are assigned the bridge scheduler.
   managedNamespaces:
     - slurm-bridge
     # - managedNamespace2
@@ -113,11 +116,13 @@ admission:
 
 # Configuration settings for the controllers.
 controllers:
-  # -- The image to use, `${repository}:${tag}`.
+  # -- The image to use, `${repository}@${digest}` when pinned, otherwise `${repository}:${tag}`.
   # Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names
   image:
     repository: ghcr.io/slinkyproject/slurm-bridge-controllers
     tag: ""
+    # -- Immutable image digest (sha256:...). Takes precedence over tag when set.
+    digest: ""
     # -- Image pull policy.
     pullPolicy: IfNotPresent
   # -- Set the number of replicas to deploy.
@@ -150,5 +155,6 @@ controllers:
 sharedConfig:
   # -- The Slurm REST API URL in the form of: `[protocol]://[host]:[port]`
   slurmRestApi: http://slurm-restapi.slurm:6820
-  # -- The secret containing a SLURM_JWT token for authentication.
+  # -- Existing Secret in the bridge namespace with key `auth-token`, injected as `SLURM_JWT`.
+  # Token issuance is external; restart consumers after Secret rotation (no hot reload).
   slurmJwtSecret: slurm-bridge-token

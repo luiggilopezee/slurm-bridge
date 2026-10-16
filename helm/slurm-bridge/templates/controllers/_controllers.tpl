@@ -28,7 +28,11 @@ Define bridge controllers image tag
 Determine bridge controllers image reference (repo:tag)
 */}}
 {{- define "slurm-bridge.controllers.imageRef" -}}
+{{- if .Values.controllers.image.digest -}}
+{{ printf "%s@%s" (include "slurm-bridge.controllers.image.repository" .) .Values.controllers.image.digest | quote }}
+{{- else -}}
 {{ printf "%s:%s" (include "slurm-bridge.controllers.image.repository" .) (include "slurm-bridge.controllers.image.tag" .) | quote }}
+{{- end -}}
 {{- end }}
 
 {{/*
