@@ -47,6 +47,14 @@ minimum was certified.
 
 ## Build and Record Artifacts
 
+Behind a corporate TLS proxy, configure the dedicated BuildKit daemon to trust
+the approved public CA bundle. Set `BUILD_CA_FILE` to the absolute path of a PEM
+bundle containing the required public trust roots for Go dependency downloads.
+Bake passes it as the optional `build_ca` secret mounted only during Go
+download/build steps; it is not copied into the runtime images. With the
+variable unset, the builder image's normal trust store is used. Keep TLS
+verification enabled, and do not include the local CA bundle in release assets.
+
 Run from a clean, reviewed checkout with the required Go/build/Helm tools,
 registry credentials supplied by the operator, and an approved fork registry. Do
 not include credentials in command output or release files. The commands below

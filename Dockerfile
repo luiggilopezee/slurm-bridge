@@ -12,13 +12,15 @@ WORKDIR /workspace
 COPY go.mod go.sum ./
 # cache deps before building and copying source so that we don't need to re-download as much
 # and so that source changes don't invalidate our downloaded layer
-RUN go mod download
+RUN --mount=type=secret,id=build_ca,target=/etc/ssl/certs/ca-certificates.crt \
+	go mod download
 
 # Copy the go source
 COPY . .
 
 # Build
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o /workspace ./...
+RUN --mount=type=secret,id=build_ca,target=/etc/ssl/certs/ca-certificates.crt \
+	CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build -o /workspace ./...
 
 ################################################################################
 

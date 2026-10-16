@@ -19,6 +19,10 @@ variable "REVISION" {
   default = ""
 }
 
+variable "BUILD_CA_FILE" {
+  default = ""
+}
+
 function "format_tag" {
   params = [registry, stage, version]
   result = format("%s:%s", join("/", compact([registry, stage])), join("-", compact([version])))
@@ -27,6 +31,7 @@ function "format_tag" {
 ################################################################################
 
 target "_common" {
+  secret = BUILD_CA_FILE == "" ? [] : ["id=build_ca,src=${BUILD_CA_FILE}"]
   labels = {
     # Ref: https://github.com/opencontainers/image-spec/blob/v1.0/annotations.md
     "org.opencontainers.image.authors" = "slinky@schedmd.com"
