@@ -15,6 +15,61 @@ chart:
   version: 1.2.3
   appVersion: 1.2.3
 tests:
+  - it: explicitly admits a non-default application namespace
+    template: configmap.yaml
+    set:
+      admission.managedNamespaces: [bridge-acceptance]
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'managedNamespaces:\n  - bridge-acceptance\n'
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: managedNamespaceSelector
+  - it: namespace selector takes precedence over the namespace list
+    template: configmap.yaml
+    set:
+      admission.managedNamespaces: [ignored-namespace]
+      admission.managedNamespaceSelector.matchLabels:
+        bridge-admission: enabled
+    asserts:
+      - matchRegex:
+          path: data["config.yaml"]
+          pattern: 'managedNamespaceSelector:\n  matchLabels:\n    bridge-admission: enabled'
+      - notMatchRegex:
+          path: data["config.yaml"]
+          pattern: 'managedNamespaces:'
+  - it: references an externally managed credential without embedding it
+    template: admission/deployment.yaml
+    set:
+      sharedConfig.slurmJwtSecret: externally-managed-slurm-token
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SLURM_JWT
+            valueFrom:
+              secretKeyRef:
+                name: externally-managed-slurm-token
+                key: auth-token
+  - it: image digest takes precedence over tag
+    template: admission/deployment.yaml
+    set:
+      admission.image.repository: registry.example.org/bridge-admission
+      admission.image.tag: ignored
+      admission.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.org/bridge-admission@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  - it: image tag is used without a digest
+    template: admission/deployment.yaml
+    set:
+      admission.image.tag: fork-test
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/slinkyproject/slurm-bridge-admission:fork-test
   - it: manifests should match snapshot
     set:
       admission:

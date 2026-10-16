@@ -29,17 +29,19 @@ Kubernetes: `>= 1.34.0-0`
 | admission.certManager.enabled | bool | `true` | Enables cert-manager for certificate management. |
 | admission.certManager.renewBefore | string | `"8760h0m0s"` | Certificate renewal time. Should be before the expiration. |
 | admission.enabled | bool | `true` | Enables admission controller. |
-| admission.image | object | `{"pullPolicy":"IfNotPresent","repository":"ghcr.io/slinkyproject/slurm-bridge-admission","tag":""}` | The image to use, `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| admission.image | object | `{"digest":"","pullPolicy":"IfNotPresent","repository":"ghcr.io/slinkyproject/slurm-bridge-admission","tag":""}` | The image to use, `${repository}@${digest}` when pinned, otherwise `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| admission.image.digest | string | `""` | Immutable image digest (sha256:...). Takes precedence over tag when set. |
 | admission.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
 | admission.managedNamespaceSelector | object | `{}` | A label selector to select namespaces to be monitored by the pod admission controller. If this is set, managedNamespaces will be ignored. Ref: https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/#label-selectors |
-| admission.managedNamespaces | list | `["slurm-bridge"]` | List of namespaces to be monitored by the pod admission controller. Pods created in any of these namespaces will have their `.spec.schedulerName` changed to slurm-bridge. |
+| admission.managedNamespaces | list | `["slurm-bridge"]` | List of namespaces to be monitored by the pod admission controller. Pods using the default scheduler in these namespaces are assigned the bridge scheduler. |
 | admission.nodeSelector | map[string]string | `{}` | Node label selector for pod assignment. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector |
 | admission.priorityClassName | string | `""` | Set the priority class to use. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/#priorityclass |
 | admission.replicas | int | `1` | Set the number of replicas to deploy. |
 | admission.resources | object | `{}` | Set container resource requests and limits for Kubernetes Pod scheduling. Ref: https://kubernetes.io/docs/concepts/configuration/manage-resources-containers/#resource-requests-and-limits-of-pod-and-container |
 | admission.tolerations | list | `[]` | Configure pod tolerations. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/ |
 | controllers.affinity | object | `{}` | Set affinity for Kubernetes Pod scheduling. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity |
-| controllers.image | object | `{"pullPolicy":"IfNotPresent","repository":"ghcr.io/slinkyproject/slurm-bridge-controllers","tag":""}` | The image to use, `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| controllers.image | object | `{"digest":"","pullPolicy":"IfNotPresent","repository":"ghcr.io/slinkyproject/slurm-bridge-controllers","tag":""}` | The image to use, `${repository}@${digest}` when pinned, otherwise `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| controllers.image.digest | string | `""` | Immutable image digest (sha256:...). Takes precedence over tag when set. |
 | controllers.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
 | controllers.nodeSelector | map[string]string | `{}` | Node label selector for pod assignment. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector |
 | controllers.priorityClassName | string | `""` | Set the priority class to use. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/pod-priority-preemption/#priorityclass |
@@ -48,10 +50,12 @@ Kubernetes: `>= 1.34.0-0`
 | controllers.tolerations | list | `[]` | Configure pod tolerations. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/ |
 | controllers.verbosity | integer | `nil` | Set the verbosity level of the controllers. |
 | fullnameOverride | string | `""` | Overrides the full name of the release. |
+| imagePullSecrets | list | `[]` |  |
 | nameOverride | string | `""` | Overrides the name of the release. |
 | namespaceOverride | string | `""` | Overrides the namespace of the release. |
 | scheduler.affinity | object | `{}` | Set affinity for Kubernetes Pod scheduling. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity |
-| scheduler.image | object | `{"pullPolicy":"IfNotPresent","repository":"ghcr.io/slinkyproject/slurm-bridge-scheduler","tag":""}` | The image to use, `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| scheduler.image | object | `{"digest":"","pullPolicy":"IfNotPresent","repository":"ghcr.io/slinkyproject/slurm-bridge-scheduler","tag":""}` | The image to use, `${repository}@${digest}` when pinned, otherwise `${repository}:${tag}`. Ref: https://kubernetes.io/docs/concepts/containers/images/#image-names |
+| scheduler.image.digest | string | `""` | Immutable image digest (sha256:...). Takes precedence over tag when set. |
 | scheduler.image.pullPolicy | string | `"IfNotPresent"` | Image pull policy. |
 | scheduler.leaderElect | bool | `false` | Enables leader election. |
 | scheduler.nodeSelector | map[string]string | `{}` | Node label selector for pod assignment. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#nodeselector |
@@ -63,6 +67,6 @@ Kubernetes: `>= 1.34.0-0`
 | schedulerConfig.mcsLabel | string | `"kubernetes"` | Set the Slurm MCS Label to use for external jobs. Ref: https://slurm.schedmd.com/sbatch.html#OPT_mcs-label |
 | schedulerConfig.partition | string | `"slurm-bridge"` | Set the default Slurm partition to use for external jobs. Ref: https://slurm.schedmd.com/sbatch.html#OPT_partition |
 | schedulerConfig.schedulerName | string | `"slurm-bridge-scheduler"` | Set the name of the scheduler. |
-| sharedConfig.slurmJwtSecret | string | `"slurm-bridge-token"` | The secret containing a SLURM_JWT token for authentication. |
+| sharedConfig.slurmJwtSecret | string | `"slurm-bridge-token"` | Existing Secret in the bridge namespace with key `auth-token`, injected as `SLURM_JWT`. Token issuance is external; restart consumers after Secret rotation (no hot reload). |
 | sharedConfig.slurmRestApi | string | `"http://slurm-restapi.slurm:6820"` | The Slurm REST API URL in the form of: `[protocol]://[host]:[port]` |
 

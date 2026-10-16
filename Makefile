@@ -57,6 +57,8 @@ all: build ## Run all build targets
 REGISTRY ?= slinky.slurm.net
 BUILDER ?= project-v3-builder
 BAKE_METADATA_FILE ?= bake-metadata.json
+SOURCE ?= https://github.com/luiggilopezee/slurm-bridge
+REVISION ?= $(shell git rev-parse HEAD)
 
 .PHONY: build
 build: build-images build-chart ## Build OCI packages.
@@ -64,7 +66,7 @@ build: build-images build-chart ## Build OCI packages.
 .PHONY: build-images
 build-images: ## Build container images.
 	- $(CONTAINER_TOOL) buildx create --name $(BUILDER)
-	REGISTRY=$(REGISTRY) VERSION=$(VERSION) $(CONTAINER_TOOL) buildx bake --builder=$(BUILDER)
+	REGISTRY=$(REGISTRY) VERSION=$(VERSION) SOURCE=$(SOURCE) REVISION=$(REVISION) $(CONTAINER_TOOL) buildx bake --builder=$(BUILDER)
 
 .PHONY: build-chart
 build-chart: helm-bin ## Build charts.
@@ -75,7 +77,7 @@ push: push-images push-charts ## Push OCI packages.
 
 .PHONY: push-images
 push-images: build-images ## Push container images.
-	REGISTRY=$(REGISTRY) VERSION=$(VERSION) $(CONTAINER_TOOL) buildx bake --builder=$(BUILDER) --push --metadata-file $(BAKE_METADATA_FILE) --sbom=true
+	REGISTRY=$(REGISTRY) VERSION=$(VERSION) SOURCE=$(SOURCE) REVISION=$(REVISION) $(CONTAINER_TOOL) buildx bake --builder=$(BUILDER) --push --metadata-file $(BAKE_METADATA_FILE) --sbom=true
 
 .PHONY: sign-images
 sign-images: push-images cosign-bin ## Sign pushed images with cosign keyless signing.
@@ -361,7 +363,7 @@ generate-docs: pandoc-bin
 	find docs -type f -name "*.md" -exec basename {} \; | awk '{print "    "$$1}' | env LC_ALL=C sort >> docs/index.rst
 	$(SED) -i -E '/<.\/docs\/[A-Za-z]*.md/s/.\/docs\///g' docs/index.rst
 	$(SED) -i -E '/.\/docs\/.*.svg/s/.\/docs\///g' docs/index.rst
-	$(SED) -i -E '/<[A-Za-z]*.md>`/s/.md>/.html>/g' docs/index.rst
+	$(SED) -i -E 's/(<[A-Za-z]+)\.md(#[^>]*)?>`/\1.html\2>`/g' docs/index.rst
 
 DOCS_IMAGE ?= $(REGISTRY)/sphinx
 

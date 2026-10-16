@@ -12,6 +12,8 @@
   - [Annotations](#annotations)
     - [Resolution rules](#resolution-rules)
     - [Supported Slurm job annotations](#supported-slurm-job-annotations)
+    - [Application Contract](#application-contract)
+    - [Resource Translation and Compatibility](#resource-translation-and-compatibility)
     - [Scheduler-managed Pod metadata](#scheduler-managed-pod-metadata)
   - [Pod grouping](#pod-grouping)
     - [Other controller owners](#other-controller-owners)
@@ -174,6 +176,88 @@ Annotations can update a Slurm job while it is pending. Slurm validates each
 change. If it rejects an update, the previous Slurm job value remains in effect.
 Once Slurm allocates the job, treat its annotations and Pod membership as fixed.
 Mail settings are an exception: the bridge sends them only at creation.
+
+### Application Contract
+
+The defaults below describe ordinary Jobs. Built-in PodGroups default the Slurm
+job name to the PodGroup name; LeaderWorkerSets derive it from the set name and
+group index. A `job-name` annotation overrides those derived names too.
+
+All annotation values are Kubernetes strings. The following suffixes use the
+`slurmjob.slinky.slurm.net/` prefix. Slurm field names refer to the v0.0.44
+creation request, not environment variables or `sbatch` command-line arguments.
+
+| Suffix      | Value and bridge validation                                                          | Default when absent                                  | Slurm field                                        |
+| ----------- | ------------------------------------------------------------------------------------ | ---------------------------------------------------- | -------------------------------------------------- |
+| `job-name`  | String, forwarded without local name validation                                      | Unset; Slurm decides                                 | `name`                                             |
+| `timelimit` | Base-10 signed 32-bit integer, minutes; Slurm validates range/policy                 | Unset; Slurm partition policy                        | `time_limit` (`set`, `number`, `infinite`)         |
+| `partition` | String, forwarded to Slurm for partition/policy validation                           | `schedulerConfig.partition`, normally `slurm-bridge` | `partition`                                        |
+| `account`   | String; Slurm validates association and permission                                   | Unset; Slurm identity/account defaults               | `account`                                          |
+| `qos`       | String; Slurm validates association and permission                                   | Unset; Slurm policy                                  | `qos`                                              |
+| `user-id`   | String accepted by the Slurm API; no local numeric or identity validation            | Unset; authenticated Slurm identity                  | `user_id`                                          |
+| `exclusive` | Case-insensitive, trimmed `false` disables exclusivity; every other value enables it | Exclusive                                            | `shared`: `["NONE"]` for exclusive, `[]` otherwise |
+| `mail-user` | Single bare email address; see [mail validation](#annotation-contract)               | Omitted; Slurm defaults                              | `mail_user`                                        |
+| `mail-type` | Case-sensitive comma-separated events; `NONE` must stand alone                       | Omitted; Slurm defaults                              | `mail_type`                                        |
+
+Use `"true"` or `"false"` for exclusivity even though the current parser accepts
+other strings. A syntactically valid annotation does not authorize a user,
+account, QoS, partition, or recipient. Slurm remains the policy authority.
+Parser errors occur during scheduling, not necessarily at Kubernetes admission.
+Unknown annotation suffixes are ignored; they are not arbitrary Slurm options.
+
+Compared with the repository's `v1.2.2` baseline
+(`004c2401b7dc73dead96bdb94e0379a3befe6800`), `mail-user` and `mail-type` are
+fork extensions, including their Pod-level precedence and creation-only
+behavior. Do not assume an upstream image with the same `1.2.2` tag implements
+them. The other names above already exist in that baseline.
+
+For an ordinary Kubernetes Job, put scheduling annotations such as `account`,
+`qos`, `partition`, and `timelimit` on **Job metadata**. Put per-Pod mail
+overrides on **`spec.template.metadata.annotations`** so generated and
+replacement Pods inherit them. Job metadata is not automatically copied to Pods.
+Putting only `account` on the template does not configure the allocation. The
+existing Job translation tests enforce this distinction. This qualifies the
+blanket Pod-template requirement in issue #6; changing general precedence would
+be a separate compatibility change. See [Pod grouping](#pod-grouping) for
+JobSets and grouped workloads.
+
+### Resource Translation and Compatibility
+
+The bridge computes effective Pod requests and limits using Kubernetes resource
+helpers, including init-container and Pod overhead handling. Across Pods in an
+allocation it takes the maximum CPU and memory quantities, not the sum of every
+Pod's resources. Workload grouping also determines node/task counts; do not
+infer a shared allocation from Job parallelism alone.
+
+| Kubernetes input                                                  | Slurm request                                                                          |
+| ----------------------------------------------------------------- | -------------------------------------------------------------------------------------- |
+| Maximum native CPU request or limit, or explicit CPU DRA quantity | `cpus_per_task`; Kubernetes `Quantity.Value()` rounds fractional CPUs up to whole CPUs |
+| Maximum memory request or limit                                   | `memory_per_node`; bytes divided by 1048576 with integer truncation                    |
+| `nvidia.com/gpu` or `amd.com/gpu` limits                          | `tres_per_node` as `gres/gpu=<maximum count>`                                          |
+| GPU DeviceClass extended-resource limits                          | `tres_per_node` as `gres/gpu:<device-class>=<maximum count>`                           |
+
+Zero CPU or memory leaves the derived setting unset for Slurm defaults. For
+predictable tests use whole CPUs, whole MiB, and equal requests and limits.
+`cpu-per-task`, `mem-per-node`, and `gres` annotations override derived values;
+keep them consistent with the Pod resources. Exclusive allocation and Slurm
+partition/account/QoS policy can increase or reject the effective allocation.
+Inspect actual allocation TRES, not just Kubernetes requests.
+
+Native CPU and CPU DRA cannot be combined. Explicit Pod `resourceClaims` are
+rejected by admission; use the supported extended-resource/GRES path. GPU
+translation chooses one maximum GRES request, not an aggregate of heterogeneous
+GPU classes. Do not combine GPU resource types expecting additive allocation.
+Different per-Pod mail settings within a shared allocation are also unsupported
+as deterministic routing: the Pod triggering creation chooses the settings.
+
+This source uses `slurm-client v1.2.2`, the Slurm **v0.0.44 external-job API**,
+and Kubernetes **1.36.0** libraries. Chart metadata declares Kubernetes
+`>=1.34.0-0` and Slurm `25.11` as its minimums. Those declarations are not a
+tested compatibility matrix; the [release record](./releasing.md) must identify
+the actual Kubernetes, Slurm, API plugins, and device drivers tested together.
+Built-in PodGroup support specifically requires Kubernetes 1.36 and its relevant
+API/feature configuration. Mail requires Slurm controller `MailProg` and relay
+configuration, not application SMTP credentials.
 
 ### Scheduler-managed Pod metadata
 
