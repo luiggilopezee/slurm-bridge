@@ -88,6 +88,45 @@ using the current chart defaults and `values-dev.yaml` overrides. Existing
 release values are not retained, so add any required cluster-specific values to
 `values-dev.yaml` before deploying.
 
+## DALI Registry Credentials
+
+The fork supports a shared `imagePullSecrets` list for the scheduler,
+controllers, and admission deployments. Reference existing Secrets in the bridge
+deployment namespace through your environment values:
+
+```yaml
+imagePullSecrets:
+	- name: registry-credentials
+```
+
+An empty list omits the PodSpec field. Provision the Secret separately; do not
+put registry credentials in chart values. This setting applies to bridge images,
+not to application workload image pulls.
+
+## DALI Mail Validation
+
+Run the local annotation and Slurm request regression tests:
+
+```sh
+go test -p 1 ./internal/utils/slurmjobir ./internal/scheduler/plugins/slurmbridge/slurmcontrol
+```
+
+For a live check, use an approved non-default application namespace, a Slurm
+cluster configured for native mail, and the
+[mail annotations](./workload.md#native-slurm-mail-dali-fork) on a small Job's
+Pod template. Keep partition/account/QoS policy annotations on Job metadata. Run
+a successful workload, a failing workload, and pending/running cancellation
+cases separately. Record the Kubernetes Job/Pod identity, the
+`scheduler.slinky.slurm.net/slurm-jobid` label, Slurm accounting state and exit
+code, and the native mail received for that allocation. Check that allocations
+are released and that controller retries do not create duplicate submissions.
+
+These are operator-run checks, not claims of passing live acceptance. Successful
+workload cleanup can still report cancellation as described in fork issue #5.
+Record that behavior rather than treating a received message as proof of correct
+terminal semantics. Sanitize evidence and exclude credentials and private mail
+contents. No cluster changes are needed to run the local regression tests.
+
 ## Specialized fixtures
 
 Install all optional Kind development fixtures:

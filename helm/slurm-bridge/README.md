@@ -48,6 +48,7 @@ Kubernetes: `>= 1.34.0-0`
 | controllers.tolerations | list | `[]` | Configure pod tolerations. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/taint-and-toleration/ |
 | controllers.verbosity | integer | `nil` | Set the verbosity level of the controllers. |
 | fullnameOverride | string | `""` | Overrides the full name of the release. |
+| imagePullSecrets | list | `[]` | Existing registry credential Secrets in the deployment namespace, shared by all components. |
 | nameOverride | string | `""` | Overrides the name of the release. |
 | namespaceOverride | string | `""` | Overrides the namespace of the release. |
 | scheduler.affinity | object | `{}` | Set affinity for Kubernetes Pod scheduling. Ref: https://kubernetes.io/docs/concepts/scheduling-eviction/assign-pod-node/#affinity-and-anti-affinity |
