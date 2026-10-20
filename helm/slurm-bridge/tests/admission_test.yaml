@@ -15,6 +15,24 @@ chart:
   version: 1.2.3
   appVersion: 1.2.3
 tests:
+  - it: digest takes precedence over an explicit tag
+    template: admission/deployment.yaml
+    set:
+      admission.image.repository: registry.example.org/admission
+      admission.image.tag: ignored
+      admission.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.org/admission@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  - it: explicit tag remains supported without a digest
+    template: admission/deployment.yaml
+    set:
+      admission.image.tag: custom
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/slinkyproject/slurm-bridge-admission:custom
   - it: image pull secrets are omitted by default
     template: admission/deployment.yaml
     asserts:

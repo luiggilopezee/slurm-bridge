@@ -15,6 +15,24 @@ chart:
   version: 1.2.3
   appVersion: 1.2.3
 tests:
+  - it: digest takes precedence over an explicit tag
+    template: scheduler/deployment.yaml
+    set:
+      scheduler.image.repository: registry.example.org/scheduler
+      scheduler.image.tag: ignored
+      scheduler.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.org/scheduler@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  - it: explicit tag remains supported without a digest
+    template: scheduler/deployment.yaml
+    set:
+      scheduler.image.tag: custom
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/slinkyproject/slurm-bridge-scheduler:custom
   - it: image pull secrets are omitted by default
     template: scheduler/deployment.yaml
     asserts:

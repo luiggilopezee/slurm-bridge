@@ -195,6 +195,7 @@ limitations under the License.
     config.md
     controllers.md
     quickstart.md
+    releasing.md
     scheduler.md
     testing.md
     usermanagement.md
