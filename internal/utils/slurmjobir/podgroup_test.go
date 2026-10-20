@@ -225,6 +225,140 @@ func podWithJobOwner(pod *corev1.Pod, jobName string) *corev1.Pod {
 	return out
 }
 
+func TestTranslateToSlurmJobIR_PodGroupMailAnnotations(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(schedulingv1alpha2.AddToScheme(scheme))
+
+	for _, policy := range []schedulingv1alpha2.PodGroupSchedulingPolicy{
+		{Basic: &schedulingv1alpha2.BasicSchedulingPolicy{}},
+		{Gang: &schedulingv1alpha2.GangSchedulingPolicy{MinCount: 1}},
+	} {
+		pg := newPodGroup("pg", "default", policy)
+		pg.Spec.PodGroupTemplateRef = &schedulingv1alpha2.PodGroupTemplateReference{
+			Workload: &schedulingv1alpha2.WorkloadPodGroupTemplateReference{
+				WorkloadName: "workload", PodGroupTemplateName: "workers",
+			},
+		}
+		workload := &schedulingv1alpha2.Workload{
+			ObjectMeta: metav1.ObjectMeta{Name: "workload", Namespace: "default", Annotations: map[string]string{
+				wellknown.AnnotationMailUser: "invalid-inherited-address",
+				wellknown.AnnotationMailType: "END",
+				wellknown.AnnotationQOS:      "workload-qos",
+			}},
+		}
+		job := jobWithAnnotations("job", "default", nil)
+		pod := podWithJobOwner(podWithSchedulingGroup("default", "pod", pg.Name), job.Name)
+		pod.Annotations = map[string]string{
+			wellknown.AnnotationMailUser: "pod@nih.gov",
+			wellknown.AnnotationQOS:      "ignored-pod-qos",
+		}
+		reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pg, workload, job, pod).Build()
+		ir, err := TranslateToSlurmJobIR(reader, context.Background(), pod)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ptr.Deref(ir.JobInfo.MailUser, "") != "pod@nih.gov" || len(ir.JobInfo.MailType) != 1 || ir.JobInfo.MailType[0] != "END" {
+			t.Errorf("mail annotations did not preserve Pod override and Workload fallback: %#v", ir.JobInfo)
+		}
+		if ptr.Deref(ir.JobInfo.QOS, "") != "workload-qos" {
+			t.Errorf("non-mail annotation precedence changed: %#v", ir.JobInfo)
+		}
+	}
+}
+
+func TestTranslateToSlurmJobIR_PodGroupEffectiveMail(t *testing.T) {
+	scheme := runtime.NewScheme()
+	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(schedulingv1alpha2.AddToScheme(scheme))
+	tests := []struct {
+		name            string
+		key             string
+		inheritedSource string
+		inheritedValue  string
+		overrideSource  string
+		overrideValue   string
+		omitWorkload    bool
+		omitWorkloadRef bool
+		wantErr         bool
+	}{
+		{name: "controller overrides invalid PodGroup event", key: wellknown.AnnotationMailType, inheritedSource: "podgroup", inheritedValue: "SUBMIT", overrideSource: "controller", overrideValue: "END"},
+		{name: "workload overrides invalid controller recipient", key: wellknown.AnnotationMailUser, inheritedSource: "controller", inheritedValue: "invalid", overrideSource: "workload", overrideValue: "workload@example.org"},
+		{name: "pod END overrides invalid workload event", key: wellknown.AnnotationMailType, inheritedSource: "workload", inheritedValue: "SUBMIT", overrideSource: "pod", overrideValue: "END"},
+		{name: "pod NONE overrides invalid workload event", key: wellknown.AnnotationMailType, inheritedSource: "workload", inheritedValue: "SUBMIT", overrideSource: "pod", overrideValue: "NONE"},
+		{name: "pod recipient overrides invalid workload recipient", key: wellknown.AnnotationMailUser, inheritedSource: "workload", inheritedValue: "invalid", overrideSource: "pod", overrideValue: "pod@example.org"},
+		{name: "invalid inherited event without override fails", key: wellknown.AnnotationMailType, inheritedSource: "podgroup", inheritedValue: "SUBMIT", wantErr: true},
+		{name: "invalid inherited recipient without override fails", key: wellknown.AnnotationMailUser, inheritedSource: "workload", inheritedValue: "invalid", wantErr: true},
+		{name: "invalid Pod event overrides valid inherited event", key: wellknown.AnnotationMailType, inheritedSource: "workload", inheritedValue: "END", overrideSource: "pod", overrideValue: "SUBMIT", wantErr: true},
+		{name: "invalid Pod recipient overrides valid inherited recipient", key: wellknown.AnnotationMailUser, inheritedSource: "controller", inheritedValue: "controller@example.org", overrideSource: "pod", overrideValue: "invalid", wantErr: true},
+		{name: "no Workload reference still applies Pod override", key: wellknown.AnnotationMailType, inheritedSource: "podgroup", inheritedValue: "SUBMIT", overrideSource: "pod", overrideValue: "NONE", omitWorkloadRef: true},
+		{name: "missing Workload still applies Pod override", key: wellknown.AnnotationMailType, inheritedSource: "controller", inheritedValue: "SUBMIT", overrideSource: "pod", overrideValue: "END", omitWorkload: true},
+		{name: "invalid inherited ordinary policy still fails", key: wellknown.AnnotationTimeLimit, inheritedSource: "podgroup", inheritedValue: "invalid", overrideSource: "workload", overrideValue: "10", wantErr: true},
+	}
+	for _, policy := range []struct {
+		name  string
+		value schedulingv1alpha2.PodGroupSchedulingPolicy
+	}{
+		{name: "basic", value: schedulingv1alpha2.PodGroupSchedulingPolicy{Basic: &schedulingv1alpha2.BasicSchedulingPolicy{}}},
+		{name: "gang", value: schedulingv1alpha2.PodGroupSchedulingPolicy{Gang: &schedulingv1alpha2.GangSchedulingPolicy{MinCount: 1}}},
+	} {
+		for _, test := range tests {
+			t.Run(policy.name+"/"+test.name, func(t *testing.T) {
+				podGroup := newPodGroup("pg", "default", policy.value)
+				podGroup.Annotations = map[string]string{
+					wellknown.AnnotationMailUser: "group@example.org",
+					wellknown.AnnotationMailType: "FAIL",
+				}
+				if !test.omitWorkloadRef {
+					podGroup.Spec.PodGroupTemplateRef = &schedulingv1alpha2.PodGroupTemplateReference{
+						Workload: &schedulingv1alpha2.WorkloadPodGroupTemplateReference{
+							WorkloadName: "workload", PodGroupTemplateName: "workers",
+						},
+					}
+				}
+				workload := &schedulingv1alpha2.Workload{
+					ObjectMeta: metav1.ObjectMeta{Name: "workload", Namespace: "default", Annotations: map[string]string{}},
+				}
+				job := jobWithAnnotations("job", "default", map[string]string{wellknown.AnnotationAccount: "controller-account"})
+				pod := podWithJobOwner(podWithSchedulingGroup("default", "pod", podGroup.Name), job.Name)
+				pod.Annotations = map[string]string{wellknown.AnnotationAccount: "ignored-pod-account"}
+				sources := map[string]map[string]string{
+					"podgroup": podGroup.Annotations, "controller": job.Annotations,
+					"workload": workload.Annotations, "pod": pod.Annotations,
+				}
+				sources[test.inheritedSource][test.key] = test.inheritedValue
+				if test.overrideSource != "" {
+					sources[test.overrideSource][test.key] = test.overrideValue
+				}
+				objects := []client.Object{podGroup, job, pod}
+				if !test.omitWorkload {
+					objects = append(objects, workload)
+				}
+				reader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objects...).Build()
+				jobIR, err := TranslateToSlurmJobIR(reader, context.Background(), pod)
+				if (err != nil) != test.wantErr {
+					t.Fatalf("TranslateToSlurmJobIR() error = %v, wantErr %v", err, test.wantErr)
+				}
+				if err != nil {
+					return
+				}
+				wantUser, wantType := "group@example.org", "FAIL"
+				if test.key == wellknown.AnnotationMailUser {
+					wantUser = test.overrideValue
+				} else {
+					wantType = test.overrideValue
+				}
+				if ptr.Deref(jobIR.JobInfo.MailUser, "") != wantUser || len(jobIR.JobInfo.MailType) != 1 || jobIR.JobInfo.MailType[0] != wantType {
+					t.Errorf("unexpected effective mail settings: %+v", jobIR.JobInfo)
+				}
+				if ptr.Deref(jobIR.JobInfo.Account, "") != "controller-account" {
+					t.Errorf("ordinary policy precedence changed: %+v", jobIR.JobInfo)
+				}
+			})
+		}
+	}
+}
+
 func TestTranslateToSlurmJobIR_PodGroupAnnotations(t *testing.T) {
 	scheme := runtime.NewScheme()
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))

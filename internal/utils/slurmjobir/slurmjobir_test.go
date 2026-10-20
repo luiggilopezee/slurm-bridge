@@ -6,6 +6,7 @@ package slurmjobir
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -539,6 +540,65 @@ func Test_parseGPUDevicePlugin(t *testing.T) {
 			}
 		})
 	}
+}
+
+func Test_parseMailAnnotations(t *testing.T) {
+	type testCase struct {
+		name    string
+		key     string
+		value   string
+		wantErr bool
+	}
+	tests := []testCase{
+		{name: "recipient", key: wellknown.AnnotationMailUser, value: "user+job@nih.gov"},
+		{name: "empty recipient", key: wellknown.AnnotationMailUser, wantErr: true},
+		{name: "local user", key: wellknown.AnnotationMailUser, value: "user", wantErr: true},
+		{name: "missing local part", key: wellknown.AnnotationMailUser, value: "@nih.gov", wantErr: true},
+		{name: "missing domain", key: wellknown.AnnotationMailUser, value: "user@", wantErr: true},
+		{name: "display name", key: wellknown.AnnotationMailUser, value: "User <user@nih.gov>", wantErr: true},
+		{name: "multiple recipients", key: wellknown.AnnotationMailUser, value: "user@nih.gov,other@nih.gov", wantErr: true},
+		{name: "recipient whitespace", key: wellknown.AnnotationMailUser, value: " user@nih.gov ", wantErr: true},
+		{name: "header injection", key: wellknown.AnnotationMailUser, value: "user@nih.gov\r\nBcc:other@nih.gov", wantErr: true},
+		{name: "empty events", key: wellknown.AnnotationMailType, wantErr: true},
+		{name: "unsupported event", key: wellknown.AnnotationMailType, value: "SUBMIT", wantErr: true},
+		{name: "lowercase event", key: wellknown.AnnotationMailType, value: "end", wantErr: true},
+		{name: "trailing comma", key: wellknown.AnnotationMailType, value: "END,", wantErr: true},
+		{name: "empty event", key: wellknown.AnnotationMailType, value: "END,,FAIL", wantErr: true},
+		{name: "none with end", key: wellknown.AnnotationMailType, value: "NONE,END", wantErr: true},
+		{name: "all with none", key: wellknown.AnnotationMailType, value: "ALL,NONE", wantErr: true},
+	}
+	for _, event := range []string{"NONE", "BEGIN", "END", "FAIL", "REQUEUE", "ALL", "INVALID_DEPEND", "STAGE_OUT", "TIME_LIMIT", "TIME_LIMIT_90", "TIME_LIMIT_80", "TIME_LIMIT_50", "ARRAY_TASKS"} {
+		tests = append(tests, testCase{name: event, key: wellknown.AnnotationMailType, value: event})
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			jobIR := &SlurmJobIR{}
+			err := parseAnnotations(jobIR, map[string]string{test.key: test.value})
+			if (err != nil) != test.wantErr {
+				t.Fatalf("parseAnnotations() = %v, wantErr %v", err, test.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), test.key) {
+				t.Errorf("diagnostic must identify annotation %q: %v", test.key, err)
+			}
+			if err == nil {
+				if test.key == wellknown.AnnotationMailUser && ptr.Deref(jobIR.JobInfo.MailUser, "") != test.value {
+					t.Errorf("recipient not preserved")
+				}
+				if test.key == wellknown.AnnotationMailType && !apiequality.Semantic.DeepEqual(jobIR.JobInfo.MailType, []string{test.value}) {
+					t.Errorf("event not preserved: %v", jobIR.JobInfo.MailType)
+				}
+			}
+		})
+	}
+	t.Run("deduplicated events", func(t *testing.T) {
+		jobIR := &SlurmJobIR{}
+		if err := parseAnnotations(jobIR, map[string]string{wellknown.AnnotationMailType: "END, FAIL,END"}); err != nil {
+			t.Fatal(err)
+		}
+		if !apiequality.Semantic.DeepEqual(jobIR.JobInfo.MailType, []string{"END", "FAIL"}) {
+			t.Errorf("events = %v, want END,FAIL", jobIR.JobInfo.MailType)
+		}
+	})
 }
 
 func Test_parseAnnotations(t *testing.T) {

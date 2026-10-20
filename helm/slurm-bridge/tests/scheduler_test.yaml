@@ -15,6 +15,23 @@ chart:
   version: 1.2.3
   appVersion: 1.2.3
 tests:
+  - it: image pull secrets are omitted by default
+    template: scheduler/deployment.yaml
+    asserts:
+      - notExists:
+          path: spec.template.spec.imagePullSecrets
+  - it: shared image pull secrets are configurable
+    template: scheduler/deployment.yaml
+    set:
+      imagePullSecrets:
+        - name: registry-primary
+        - name: registry-secondary
+    asserts:
+      - equal:
+          path: spec.template.spec.imagePullSecrets
+          value:
+            - name: registry-primary
+            - name: registry-secondary
   - it: manifests should match snapshot
     asserts:
       - matchSnapshot: {}

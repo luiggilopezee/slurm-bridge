@@ -12,6 +12,7 @@
   - [Annotations](#annotations)
     - [Resolution rules](#resolution-rules)
     - [Supported Slurm job annotations](#supported-slurm-job-annotations)
+    - [Native Slurm mail (DALI fork)](#native-slurm-mail-dali-fork)
     - [Scheduler-managed Pod metadata](#scheduler-managed-pod-metadata)
   - [Pod grouping](#pod-grouping)
     - [Other controller owners](#other-controller-owners)
@@ -154,6 +155,7 @@ Keys that do not conflict are combined.
 | Scheduling policy       | `constraints`, `exclusive`, `licenses`, `partition`, `priority`, `qos`, `reservation` |
 | Resources               | `cpu-per-task`, `gres`, `max-nodes`, `mem-per-node`, `min-nodes`                      |
 | Naming and duration     | `job-name`, `timelimit`                                                               |
+| Native mail (DALI fork) | `mail-user`, `mail-type`                                                              |
 
 Prefix every suffix with `slurmjob.slinky.slurm.net/`; for example,
 `slurmjob.slinky.slurm.net/account`. Node counts, priority, and `timelimit` are
@@ -161,9 +163,61 @@ base-10 integers; `timelimit` is measured in minutes. CPU and memory accept
 Kubernetes quantities. `exclusive: "false"` requests non-exclusive placement;
 exclusive placement is the default.
 
-Annotations can update a Slurm job while it is pending. Slurm validates each
-change. If it rejects an update, the previous Slurm job value remains in effect.
-Once Slurm allocates the job, treat its annotations and Pod membership as fixed.
+Annotations other than the creation-time mail settings can update a Slurm job
+while it is pending. Slurm validates each change. If it rejects an update, the
+previous Slurm job value remains in effect. Once Slurm allocates the job, treat
+its annotations and Pod membership as fixed.
+
+### Native Slurm mail (DALI fork)
+
+The DALI fork accepts `slurmjob.slinky.slurm.net/mail-user` and
+`slurmjob.slinky.slurm.net/mail-type` when creating an external allocation.
+Slurm delivers the mail through its configured `MailProg`; the bridge does not
+send SMTP mail or require application SMTP credentials. Mail delivery must be
+configured and permitted by the Slurm administrator.
+
+- `mail-user` must be one bare email address, such as `user@example.org`. Empty
+  values, display names, address lists, and newline characters are rejected.
+- `mail-type` is a comma-separated, case-sensitive list of `NONE`, `BEGIN`,
+  `END`, `FAIL`, `REQUEUE`, `ALL`, `INVALID_DEPEND`, `STAGE_OUT`, `TIME_LIMIT`,
+  `TIME_LIMIT_90`, `TIME_LIMIT_80`, `TIME_LIMIT_50`, or `ARRAY_TASKS`.
+  Surrounding whitespace is trimmed and duplicate events are removed. Empty or
+  unknown events are rejected with a diagnostic identifying the annotation.
+- `NONE` disables mail and cannot be combined with other events. `ALL` expands
+  to `BEGIN,END,FAIL,REQUEUE,STAGE_OUT,INVALID_DEPEND`, including
+  invalid-dependency mail as defined by Slurm 25.11. Time-limit events and
+  `ARRAY_TASKS` must be requested separately.
+- Slurm v0.0.44 receives `mail_user` and `mail_type`; `INVALID_DEPEND` maps to
+  `INVALID_DEPENDENCY` and time-limit events map to `TIME=100%`, `TIME=90%`,
+  `TIME=80%`, and `TIME=50%`. An absent annotation leaves its API field unset.
+
+Only these two mail keys support per-key overrides from the scheduling Pod. For
+a Job, set them on `spec.template.metadata.annotations` to propagate to Pods, or
+on Job metadata as fallback. Ordinary policy keys such as `account` still come
+from Job metadata. Built-in PodGroups retain the annotation chain above,
+followed by the scheduling Pod's mail overrides. Use consistent mail settings
+across all Pods sharing an allocation.
+
+```yaml
+spec:
+  template:
+    metadata:
+      annotations:
+        slurmjob.slinky.slurm.net/mail-user: user@example.org
+        slurmjob.slinky.slurm.net/mail-type: BEGIN,END,FAIL
+```
+
+Mail settings are sent only on allocation creation. Pending allocation updates
+do not overwrite them, and changing annotations does not reconfigure existing
+allocation mail. `BEGIN` indicates allocation execution start, not API
+acceptance or submission confirmation. Mail follows the Slurm allocation
+lifecycle, not application result availability.
+
+**Known limitation:** successful Kubernetes workload cleanup can still cancel
+the Slurm allocation and produce cancellation outcomes or notifications. This
+port does not resolve
+[fork issue #5](https://github.com/luiggilopezee/slurm-bridge/issues/5) or
+certify correct successful-completion mail.
 
 ### Scheduler-managed Pod metadata
 

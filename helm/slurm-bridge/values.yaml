@@ -9,6 +9,9 @@ fullnameOverride: ""
 # -- Overrides the namespace of the release.
 namespaceOverride: ""
 
+# -- Existing registry credential Secrets in the deployment namespace, shared by all components.
+imagePullSecrets: []
+
 # Default values for slurm-bridge.
 scheduler:
   # -- The image to use, `${repository}:${tag}`.

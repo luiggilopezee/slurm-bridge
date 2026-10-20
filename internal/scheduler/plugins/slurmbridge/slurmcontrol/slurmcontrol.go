@@ -64,6 +64,49 @@ type GresLayout struct {
 	Type  string
 }
 
+func mailTypesFromAnnotations(events []string) *[]api.V0044JobDescMsgMailType {
+	if events == nil {
+		return nil
+	}
+	mailTypes := []api.V0044JobDescMsgMailType{}
+	seen := make(map[api.V0044JobDescMsgMailType]bool)
+	for _, event := range events {
+		var values []api.V0044JobDescMsgMailType
+		switch event {
+		case "NONE":
+			continue
+		case "ALL":
+			values = []api.V0044JobDescMsgMailType{
+				api.V0044JobDescMsgMailTypeBEGIN,
+				api.V0044JobDescMsgMailTypeEND,
+				api.V0044JobDescMsgMailTypeFAIL,
+				api.V0044JobDescMsgMailTypeREQUEUE,
+				api.V0044JobDescMsgMailTypeSTAGEOUT,
+				api.V0044JobDescMsgMailTypeINVALIDDEPENDENCY,
+			}
+		case "TIME_LIMIT":
+			values = []api.V0044JobDescMsgMailType{api.V0044JobDescMsgMailTypeTIME100}
+		case "INVALID_DEPEND":
+			values = []api.V0044JobDescMsgMailType{api.V0044JobDescMsgMailTypeINVALIDDEPENDENCY}
+		case "TIME_LIMIT_90":
+			values = []api.V0044JobDescMsgMailType{api.V0044JobDescMsgMailTypeTIME90}
+		case "TIME_LIMIT_80":
+			values = []api.V0044JobDescMsgMailType{api.V0044JobDescMsgMailTypeTIME80}
+		case "TIME_LIMIT_50":
+			values = []api.V0044JobDescMsgMailType{api.V0044JobDescMsgMailTypeTIME50}
+		default:
+			values = []api.V0044JobDescMsgMailType{api.V0044JobDescMsgMailType(event)}
+		}
+		for _, value := range values {
+			if !seen[value] {
+				mailTypes = append(mailTypes, value)
+				seen[value] = true
+			}
+		}
+	}
+	return &mailTypes
+}
+
 func sharedFromExclusiveAnnotation(slurmJobIR *slurmjobir.SlurmJobIR) *[]api.V0044JobDescMsgShared {
 	exclusive := true
 	if slurmJobIR != nil && slurmJobIR.JobInfo.Exclusive != nil {
@@ -242,6 +285,8 @@ func (r *realSlurmControl) submitJob(ctx context.Context, pod *corev1.Pod, slurm
 		},
 	}
 	if !update {
+		jobSubmit.Job.MailUser = slurmJobIR.JobInfo.MailUser
+		jobSubmit.Job.MailType = mailTypesFromAnnotations(slurmJobIR.JobInfo.MailType)
 		if err := r.Create(ctx, job, jobSubmit); err != nil {
 			logger.Error(err, "could not create external job", "pod", klog.KObj(pod))
 			return 0, err

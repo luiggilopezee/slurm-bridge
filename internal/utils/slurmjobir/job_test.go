@@ -18,6 +18,8 @@ import (
 	"k8s.io/utils/ptr"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	"github.com/SlinkyProject/slurm-bridge/internal/wellknown"
 )
 
 func newJob(name string) *batchv1.Job {
@@ -50,6 +52,54 @@ func newJobPod(name, jobName string) *corev1.Pod {
 				"job-name": jobName,
 			},
 		},
+	}
+}
+
+func TestTranslateJobMailAnnotations(t *testing.T) {
+	tests := []struct {
+		name        string
+		annotations map[string]string
+		wantUser    string
+		wantType    []string
+		wantErr     bool
+	}{
+		{name: "root fallback", wantUser: "root@nih.gov", wantType: []string{"END"}},
+		{name: "template overrides", annotations: map[string]string{
+			wellknown.AnnotationMailUser: "template@nih.gov",
+			wellknown.AnnotationMailType: "BEGIN,FAIL",
+			wellknown.AnnotationAccount:  "pod-account",
+		}, wantUser: "template@nih.gov", wantType: []string{"BEGIN", "FAIL"}},
+		{name: "per-key fallback", annotations: map[string]string{wellknown.AnnotationMailUser: "template@nih.gov"}, wantUser: "template@nih.gov", wantType: []string{"END"}},
+		{name: "explicit none", annotations: map[string]string{wellknown.AnnotationMailType: "NONE"}, wantUser: "root@nih.gov", wantType: []string{"NONE"}},
+		{name: "invalid template", annotations: map[string]string{wellknown.AnnotationMailUser: "bad"}, wantErr: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			job := newJob("mail-job")
+			job.Annotations = map[string]string{
+				wellknown.AnnotationMailUser: "root@nih.gov",
+				wellknown.AnnotationMailType: "END",
+				wellknown.AnnotationAccount:  "root-account",
+			}
+			job.Spec.Template.Annotations = test.annotations
+			pod := newJobPod("mail-pod", job.Name)
+			pod.Annotations = job.Spec.Template.Annotations
+			pod.OwnerReferences = []metav1.OwnerReference{*metav1.NewControllerRef(job, batchv1.SchemeGroupVersion.WithKind("Job"))}
+			reader := fake.NewClientBuilder().WithObjects(job, pod).Build()
+			got, err := TranslateToSlurmJobIR(reader, context.Background(), pod)
+			if (err != nil) != test.wantErr {
+				t.Fatalf("TranslateToSlurmJobIR() = %v, wantErr %v", err, test.wantErr)
+			}
+			if err != nil {
+				return
+			}
+			if ptr.Deref(got.JobInfo.MailUser, "") != test.wantUser || !apiequality.Semantic.DeepEqual(got.JobInfo.MailType, test.wantType) {
+				t.Errorf("unexpected mail settings: %+v", got.JobInfo)
+			}
+			if ptr.Deref(got.JobInfo.Account, "") != "root-account" {
+				t.Error("mail annotations changed existing account precedence")
+			}
+		})
 	}
 }
 
