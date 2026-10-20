@@ -19,6 +19,8 @@ scheduler:
   image:
     repository: ghcr.io/slinkyproject/slurm-bridge-scheduler
     tag: ""
+    # -- Immutable image digest; when set, takes precedence over tag.
+    digest: ""
     # -- Image pull policy.
     pullPolicy: IfNotPresent
   # -- Set the number of replicas to deploy.
@@ -69,6 +71,8 @@ admission:
   image:
     repository: ghcr.io/slinkyproject/slurm-bridge-admission
     tag: ""
+    # -- Immutable image digest; when set, takes precedence over tag.
+    digest: ""
     # -- Image pull policy.
     pullPolicy: IfNotPresent
   # Cert-Manager certificate configurations.
@@ -120,6 +124,8 @@ controllers:
   image:
     repository: ghcr.io/slinkyproject/slurm-bridge-controllers
     tag: ""
+    # -- Immutable image digest; when set, takes precedence over tag.
+    digest: ""
     # -- Image pull policy.
     pullPolicy: IfNotPresent
   # -- Set the number of replicas to deploy.

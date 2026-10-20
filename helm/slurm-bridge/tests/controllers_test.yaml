@@ -14,6 +14,24 @@ chart:
   version: 1.2.3
   appVersion: 1.2.3
 tests:
+  - it: digest takes precedence over an explicit tag
+    template: controllers/deployment.yaml
+    set:
+      controllers.image.repository: registry.example.org/controllers
+      controllers.image.tag: ignored
+      controllers.image.digest: sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.org/controllers@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+  - it: explicit tag remains supported without a digest
+    template: controllers/deployment.yaml
+    set:
+      controllers.image.tag: custom
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/slinkyproject/slurm-bridge-controllers:custom
   - it: image pull secrets are omitted by default
     template: controllers/deployment.yaml
     asserts:

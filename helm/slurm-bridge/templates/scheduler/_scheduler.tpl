@@ -45,5 +45,9 @@ Define scheduler image tag
 Determine scheduler image reference (repo:tag)
 */}}
 {{- define "slurm-bridge.scheduler.imageRef" -}}
+{{- if .Values.scheduler.image.digest -}}
+{{ printf "%s@%s" (include "slurm-bridge.scheduler.image.repository" .) .Values.scheduler.image.digest | quote }}
+{{- else -}}
 {{ printf "%s:%s" (include "slurm-bridge.scheduler.image.repository" .) (include "slurm-bridge.scheduler.image.tag" .) | quote }}
+{{- end }}
 {{- end }}
