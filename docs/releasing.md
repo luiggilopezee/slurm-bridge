@@ -1,9 +1,12 @@
 # DALI Release Deployment
 
-Release `1.2.3-dali.1` is based on upstream `v1.2.3` and merged fork PR #8. It
-includes shared registry pull Secrets, native Slurm mail annotations, and the
-reviewed PodGroup mail override fix. This release adds immutable image digest
-support and build provenance metadata.
+Release `1.2.3-dali.2` is based on upstream `v1.2.3` and merged fork PRs #8 and
+#9. It includes shared registry pull Secrets, native Slurm mail annotations, and
+the reviewed PodGroup mail override fix, immutable image digest support, and
+build provenance metadata. It updates kin-openapi, OpenTelemetry, and x/net to
+address the fixable vulnerabilities found in the previous release. The x/crypto
+finding `GO-2026-5932` has no published fix; this is not a vulnerability-free
+certification.
 
 This is a prerelease. Fork issue #5 remains unresolved: successful workload
 cleanup can report a cancelled Slurm allocation and cancellation notifications.
@@ -52,7 +55,7 @@ repository.
 
 ## Image Build
 
-Build from the clean release commit, using `VERSION=1.2.3-dali.1`, the approved
+Build from the clean release commit, using `VERSION=1.2.3-dali.2`, the approved
 `REGISTRY`, `SOURCE=https://github.com/luiggilopezee/slurm-bridge`, and
 `REVISION=$(git rev-parse HEAD)` with Docker Bake. Publish both `linux/amd64`
 and `linux/arm64` with `--sbom=true --provenance=mode=max`, and retain the
