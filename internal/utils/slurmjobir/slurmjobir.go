@@ -160,15 +160,6 @@ func TranslateToSlurmJobIR(c client.Client, ctx context.Context, pod *corev1.Pod
 		err = parseAnnotations(slurmJobIR, annotations)
 	} else {
 		err = t.applySlurmAnnotations(slurmJobIR, pod, rootPOM)
-		if err == nil {
-			mailAnnotations := make(map[string]string, 2)
-			for _, key := range []string{wellknown.AnnotationMailUser, wellknown.AnnotationMailType} {
-				if value, ok := pod.Annotations[key]; ok {
-					mailAnnotations[key] = value
-				}
-			}
-			err = parseAnnotations(slurmJobIR, mailAnnotations)
-		}
 	}
 	return slurmJobIR, err
 }

@@ -43,8 +43,21 @@ func (t *translator) parsePodGroupSlurmAnnotations(
 	slurmJobIR *SlurmJobIR,
 	pg *schedulingv1alpha2.PodGroup,
 	controllerPOM *metav1.PartialObjectMetadata,
+	mailAnnotations map[string]string,
 ) error {
-	if err := parseAnnotations(slurmJobIR, pg.GetAnnotations()); err != nil {
+	parsePolicyAnnotations := func(annotations map[string]string) error {
+		policyAnnotations := make(map[string]string, len(annotations))
+		for key, value := range annotations {
+			switch key {
+			case wellknown.AnnotationMailUser, wellknown.AnnotationMailType:
+				mailAnnotations[key] = value
+			default:
+				policyAnnotations[key] = value
+			}
+		}
+		return parseAnnotations(slurmJobIR, policyAnnotations)
+	}
+	if err := parsePolicyAnnotations(pg.GetAnnotations()); err != nil {
 		return err
 	}
 	if controllerPOM != nil {
@@ -60,7 +73,7 @@ func (t *translator) parsePodGroupSlurmAnnotations(
 				ann = jobSet.GetAnnotations()
 			}
 		}
-		if err := parseAnnotations(slurmJobIR, ann); err != nil {
+		if err := parsePolicyAnnotations(ann); err != nil {
 			return err
 		}
 	}
@@ -76,7 +89,7 @@ func (t *translator) parsePodGroupSlurmAnnotations(
 		}
 		return err
 	}
-	return parseAnnotations(slurmJobIR, wl.GetAnnotations())
+	return parsePolicyAnnotations(wl.GetAnnotations())
 }
 
 // applySlurmAnnotations merges Slurm job annotations for the scheduling root object.
@@ -100,7 +113,16 @@ func (t *translator) applySlurmAnnotations(
 	if err != nil {
 		return err
 	}
-	return t.parsePodGroupSlurmAnnotations(slurmJobIR, pg, controllerPOM)
+	mailAnnotations := make(map[string]string, 2)
+	if err := t.parsePodGroupSlurmAnnotations(slurmJobIR, pg, controllerPOM, mailAnnotations); err != nil {
+		return err
+	}
+	for _, key := range []string{wellknown.AnnotationMailUser, wellknown.AnnotationMailType} {
+		if value, ok := pod.Annotations[key]; ok {
+			mailAnnotations[key] = value
+		}
+	}
+	return parseAnnotations(slurmJobIR, mailAnnotations)
 }
 
 func schedulingGroupsMatch(a, b *corev1.PodSchedulingGroup) bool {

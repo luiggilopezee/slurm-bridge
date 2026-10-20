@@ -96,7 +96,7 @@ deployment namespace through your environment values:
 
 ```yaml
 imagePullSecrets:
-	- name: registry-credentials
+  - name: registry-credentials
 ```
 
 An empty list omits the PodSpec field. Provision the Secret separately; do not
